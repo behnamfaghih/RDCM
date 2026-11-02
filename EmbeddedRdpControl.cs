@@ -1,0 +1,475 @@
+using System.Runtime.InteropServices;
+using System.Windows.Forms;
+using Microsoft.CSharp.RuntimeBinder;
+
+namespace RDCM;
+
+/// <summary>
+/// Hosts the Remote Desktop ActiveX control. Connection lifecycle decisions live in
+/// <see cref="RdpConnectionController"/>; this class adapts the native control and owns display settings.
+/// </summary>
+public sealed class EmbeddedRdpControl : AxHost
+{
+    private const string RdpClientClassId = "{8B918B82-7985-4C24-89DF-C33AD2BBFBCD}";
+    private const int TransitionPollInterval = 250;
+    private const int SteadyPollInterval = 1000;
+
+    private readonly RdpConnectionController _controller;
+    private readonly System.Windows.Forms.Timer _pollTimer;
+    private readonly System.Windows.Forms.Timer _resizeTimer;
+    private ConnectionPointCookie? _eventCookie;
+    private RemoteResolution _resolution = RemoteDisplayOptions.Resolutions[0];
+    private RemoteScale _scale = RemoteDisplayOptions.Scales[0];
+    private RemoteResolution _activeResolution = RemoteDisplayOptions.Resolutions[0];
+    private RemoteScale _activeScale = RemoteDisplayOptions.Scales[0];
+    private RdpSessionState _lastPublishedState = RdpSessionState.Created;
+    private System.Drawing.Size? _layoutSize;
+    private (int Width, int Height) _requestedDesktopSize;
+    private bool _startScheduled;
+    private bool _hasReportedDisplayError;
+    private bool _displaySettingsChanged;
+    private bool _disposed;
+
+    /// <summary>Raised (in order) whenever the session state or status text changes.</summary>
+    public event Action<RdpSessionSnapshot>? SessionChanged;
+    public event Action<string>? DisplayError;
+
+    public RdpSessionSnapshot Snapshot => _controller.Snapshot;
+    public bool HasActiveSession => _controller.HasActiveSession;
+
+    /// <summary>True while the control shows its own sign-in dialog. The control must not be disposed until it closes.</summary>
+    public bool IsNativeDialogOpen => _controller.NativeDialogOpen;
+    public RemoteResolution RequestedResolution => _resolution;
+    public RemoteScale RequestedScale => _scale;
+    public RemoteResolution ActiveResolution => _activeResolution;
+    public RemoteScale ActiveScale => _activeScale;
+
+    private bool IsSessionConnected => _controller.State == RdpSessionState.Connected;
+
+    public EmbeddedRdpControl(SessionIdentity identity) : base(RdpClientClassId)
+    {
+        _controller = new RdpConnectionController(identity, new NativeClient(this), log: AppLog.Warning);
+        _controller.Changed += OnControllerChanged;
+        Dock = DockStyle.Fill;
+        BackColor = System.Drawing.Color.FromArgb(20, 21, 23);
+        _pollTimer = new System.Windows.Forms.Timer { Interval = TransitionPollInterval };
+        _pollTimer.Tick += (_, _) => Poll();
+        _resizeTimer = new System.Windows.Forms.Timer { Interval = 350 };
+        _resizeTimer.Tick += (_, _) =>
+        {
+            _resizeTimer.Stop();
+            if (IsSessionConnected && _resolution.IsFitToTab && GetRequestedResolution() != _requestedDesktopSize)
+            {
+                ApplyDisplaySettings();
+            }
+        };
+    }
+
+    /// <summary>
+    /// Size of the tab's session area in device pixels. Used for fit-to-tab resolution while the
+    /// native surface is hidden (for example during connection setup).
+    /// </summary>
+    [System.ComponentModel.Browsable(false)]
+    [System.ComponentModel.DesignerSerializationVisibility(System.ComponentModel.DesignerSerializationVisibility.Hidden)]
+    public System.Drawing.Size? LayoutSize
+    {
+        get => _layoutSize;
+        set
+        {
+            if (_layoutSize == value)
+            {
+                return;
+            }
+            _layoutSize = value;
+            ScheduleFitToTabUpdate();
+        }
+    }
+
+    public void DisconnectSession()
+    {
+        if (!_disposed && _controller.Disconnect())
+        {
+            UpdatePolling();
+        }
+    }
+
+    /// <summary>
+    /// Creates the native window while the host is hidden. WinForms never creates handles for invisible
+    /// controls, and the session surface stays hidden until the connection is established.
+    /// </summary>
+    public void EnsureHandle()
+    {
+        if (!_disposed && !IsDisposed && !IsHandleCreated)
+        {
+            _ = Handle;
+        }
+    }
+
+    public void ReconnectSession() => ReconnectWithIdentity(null);
+
+    public void ReconnectWithIdentity(SessionIdentity? identity)
+    {
+        if (!_disposed && _controller.Reconnect(identity))
+        {
+            UpdatePolling();
+        }
+    }
+
+    protected override void CreateSink()
+    {
+        try
+        {
+            var ocx = GetOcx() ?? throw new InvalidOperationException("The Remote Desktop control was not created.");
+            _eventCookie = new ConnectionPointCookie(ocx, new RdpClientEventSink(DispatchNativeEvent), typeof(IMsTscAxEvents));
+            _controller.NativeEventsAvailable = true;
+        }
+        catch (Exception exception) when (exception is not OutOfMemoryException)
+        {
+            AppLog.Warning("Remote Desktop events are unavailable; falling back to state polling.", exception);
+            _controller.NativeEventsAvailable = false;
+        }
+    }
+
+    protected override void DetachSink()
+    {
+        _eventCookie?.Disconnect();
+        _eventCookie = null;
+    }
+
+    protected override void OnHandleCreated(EventArgs e)
+    {
+        base.OnHandleCreated(e);
+        if (_startScheduled)
+        {
+            return;
+        }
+        _startScheduled = true;
+        BeginInvoke(new Action(() =>
+        {
+            if (_disposed)
+            {
+                return;
+            }
+            _controller.Start();
+            UpdatePolling();
+        }));
+    }
+
+    protected override void OnSizeChanged(EventArgs e)
+    {
+        base.OnSizeChanged(e);
+        ScheduleFitToTabUpdate();
+    }
+
+    private void ScheduleFitToTabUpdate()
+    {
+        if (!_disposed && IsSessionConnected && _resolution.IsFitToTab)
+        {
+            _resizeTimer.Stop();
+            _resizeTimer.Start();
+        }
+    }
+
+    private void DispatchNativeEvent(Action<RdpConnectionController> handler)
+    {
+        if (_disposed)
+        {
+            return;
+        }
+        try
+        {
+            handler(_controller);
+        }
+        catch (Exception exception) when (exception is not OutOfMemoryException)
+        {
+            // Never let a managed exception escape into the ActiveX control.
+            AppLog.Error("Handling a Remote Desktop event failed.", exception);
+        }
+        UpdatePolling();
+        if (_controller.HasPendingWork && IsHandleCreated)
+        {
+            BeginInvoke(new Action(Poll));
+        }
+    }
+
+    private void Poll()
+    {
+        if (_disposed)
+        {
+            return;
+        }
+        _controller.Poll();
+        UpdatePolling();
+    }
+
+    private void UpdatePolling()
+    {
+        if (_disposed || !_controller.NeedsPolling)
+        {
+            _pollTimer.Stop();
+            return;
+        }
+        var interval = _controller.State is RdpSessionState.Connected
+            or RdpSessionState.Disconnected or RdpSessionState.Failed
+            ? SteadyPollInterval
+            : TransitionPollInterval;
+        if (_pollTimer.Interval != interval)
+        {
+            _pollTimer.Interval = interval;
+        }
+        _pollTimer.Start();
+    }
+
+    private void OnControllerChanged(RdpSessionSnapshot snapshot)
+    {
+        var enteredConnected = snapshot.State == RdpSessionState.Connected &&
+                               _lastPublishedState != RdpSessionState.Connected;
+        _lastPublishedState = snapshot.State;
+        SessionChanged?.Invoke(snapshot);
+        if (!enteredConnected)
+        {
+            return;
+        }
+
+        if (_displaySettingsChanged)
+        {
+            ApplyDisplaySettings();
+        }
+        else
+        {
+            _activeResolution = _resolution;
+            _activeScale = _scale;
+            _controller.UpdateConnectedMessage(DescribeConnectedDisplay());
+        }
+    }
+
+    public bool SetResolution(RemoteResolution resolution)
+    {
+        if (_resolution == resolution)
+        {
+            return true;
+        }
+
+        var previous = _resolution;
+        _resolution = resolution;
+        _displaySettingsChanged = true;
+        if (IsSessionConnected && !ApplyDisplaySettings())
+        {
+            _resolution = previous;
+            return false;
+        }
+        return true;
+    }
+
+    public bool SetScale(RemoteScale scale)
+    {
+        if (_scale == scale)
+        {
+            return true;
+        }
+
+        var previous = _scale;
+        _scale = scale;
+        _displaySettingsChanged = true;
+        if (IsSessionConnected && !ApplyDisplaySettings())
+        {
+            _scale = previous;
+            return false;
+        }
+        return true;
+    }
+
+    private (int Width, int Height) GetRequestedResolution()
+    {
+        if (!_resolution.IsFitToTab)
+        {
+            return (_resolution.Width, _resolution.Height);
+        }
+
+        static int RoundToSupportedSize(int size, int minimum) =>
+            Math.Clamp(size - size % 4, minimum, 8192);
+
+        var size = GetSessionAreaSize();
+        return (RoundToSupportedSize(size.Width, 640), RoundToSupportedSize(size.Height, 480));
+    }
+
+    private System.Drawing.Size GetSessionAreaSize() =>
+        _layoutSize is { Width: > 0, Height: > 0 } layout ? layout : new System.Drawing.Size(Width, Height);
+
+    private string DescribeConnectedDisplay()
+    {
+        var (width, height) = GetRequestedResolution();
+        return $"Connected · {width} × {height} · {_scale.Percent}%";
+    }
+
+    private bool ApplyDisplaySettings()
+    {
+        try
+        {
+            dynamic client = GetOcx()
+                ?? throw new InvalidOperationException("The Remote Desktop control is unavailable.");
+            var (width, height) = GetRequestedResolution();
+            var area = GetSessionAreaSize();
+            var physicalWidth = GetPhysicalSizeMillimeters(area.Width);
+            var physicalHeight = GetPhysicalSizeMillimeters(area.Height);
+
+            client.UpdateSessionDisplaySettings(
+                (uint)width,
+                (uint)height,
+                physicalWidth,
+                physicalHeight,
+                0u,
+                _scale.Percent,
+                GetDeviceScaleFactor());
+            client.AdvancedSettings9.SmartSizing = true;
+            _requestedDesktopSize = (width, height);
+            _displaySettingsChanged = false;
+            _hasReportedDisplayError = false;
+            _activeResolution = _resolution;
+            _activeScale = _scale;
+            _controller.UpdateConnectedMessage(DescribeConnectedDisplay());
+            return true;
+        }
+        catch (COMException exception)
+        {
+            RestoreActiveDisplaySettings();
+            ReportDisplayError(
+                "The remote computer rejected the display change. It may not support dynamic resolution or scaling.",
+                exception);
+        }
+        catch (InvalidComObjectException exception)
+        {
+            RestoreActiveDisplaySettings();
+            ReportDisplayError("The Remote Desktop control stopped responding.", exception);
+        }
+        catch (RuntimeBinderException exception)
+        {
+            RestoreActiveDisplaySettings();
+            ReportDisplayError("This version of Remote Desktop doesn't support changing display settings during a session.", exception);
+        }
+        catch (InvalidOperationException exception)
+        {
+            RestoreActiveDisplaySettings();
+            ReportDisplayError(exception.Message, exception);
+        }
+        return false;
+    }
+
+    private void RestoreActiveDisplaySettings()
+    {
+        _resolution = _activeResolution;
+        _scale = _activeScale;
+        _displaySettingsChanged = false;
+    }
+
+    private uint GetPhysicalSizeMillimeters(int sizeInPixels)
+    {
+        var dpi = DeviceDpi > 0 ? DeviceDpi : 96;
+        var millimeters = (uint)Math.Clamp(
+            Math.Round(sizeInPixels * 25.4 / dpi),
+            10,
+            10_000);
+        return millimeters;
+    }
+
+    private uint GetDeviceScaleFactor()
+    {
+        var scale = DeviceDpi * 100d / 96;
+        return (uint)new[] { 100, 140, 180 }
+            .OrderBy(candidate => Math.Abs(candidate - scale))
+            .First();
+    }
+
+    private void ReportDisplayError(string message, Exception exception)
+    {
+        AppLog.Warning($"Display change failed: {message}", exception);
+        _controller.UpdateConnectedMessage(message);
+        if (_hasReportedDisplayError)
+        {
+            return;
+        }
+
+        _hasReportedDisplayError = true;
+        DisplayError?.Invoke(message);
+    }
+
+    protected override void Dispose(bool disposing)
+    {
+        if (disposing && !_disposed)
+        {
+            _controller.Shutdown();
+            _disposed = true;
+            _pollTimer.Dispose();
+            _resizeTimer.Dispose();
+            _controller.Changed -= OnControllerChanged;
+            DetachSink();
+        }
+
+        base.Dispose(disposing);
+    }
+
+    /// <summary>Adapts the ActiveX automation interface; translates native failures to <see cref="RdpClientException"/>.</summary>
+    private sealed class NativeClient(EmbeddedRdpControl owner) : IRdpNativeClient
+    {
+        public bool IsReady => !owner._disposed && owner.IsHandleCreated && owner.GetOcx() is not null;
+
+        public int ReadConnectionState() =>
+            Invoke(client => (int)client.Connected, "Couldn't read the connection state");
+
+        public void BeginConnect(SessionIdentity identity) => Invoke(client =>
+        {
+            client.Server = identity.Host.Trim().TrimStart('[').TrimEnd(']');
+            client.UserName = identity.Username.Trim();
+            var (width, height) = owner.GetRequestedResolution();
+            client.DesktopWidth = width;
+            client.DesktopHeight = height;
+            owner._requestedDesktopSize = (width, height);
+            client.AdvancedSettings9.RDPPort = identity.Port;
+            client.AdvancedSettings9.EnableCredSspSupport = true;
+            client.AdvancedSettings9.AuthenticationLevel = 2;
+            client.AdvancedSettings9.SmartSizing = true;
+            client.Connect();
+            return 0;
+        }, "Remote Desktop couldn't start the connection");
+
+        public void RequestDisconnect() => Invoke(client =>
+        {
+            client.Disconnect();
+            return 0;
+        }, "Remote Desktop rejected the disconnect request");
+
+        public RdpDisconnectInfo DescribeDisconnect(int reason)
+        {
+            try
+            {
+                dynamic client = owner.GetOcx() ?? throw new InvalidOperationException("Control unavailable.");
+                var extended = (int)client.ExtendedDisconnectReason;
+                return new RdpDisconnectInfo(extended, (string)client.GetErrorDescription((uint)reason, extended));
+            }
+            catch (Exception exception) when (IsNativeFailure(exception))
+            {
+                AppLog.Warning($"No description is available for disconnect reason {reason}.", exception);
+                return new RdpDisconnectInfo(0, null);
+            }
+        }
+
+        private T Invoke<T>(Func<dynamic, T> action, string message)
+        {
+            try
+            {
+                dynamic client = owner.GetOcx()
+                    ?? throw new InvalidOperationException("The Remote Desktop control is not available.");
+                return action(client);
+            }
+            catch (Exception exception) when (IsNativeFailure(exception))
+            {
+                var code = exception is COMException com ? $" (error 0x{com.HResult:X8})" : "";
+                throw new RdpClientException($"{message}{code}.", exception);
+            }
+        }
+
+        private static bool IsNativeFailure(Exception exception) =>
+            exception is COMException or InvalidComObjectException or RuntimeBinderException
+                or InvalidOperationException or InvalidCastException;
+    }
+}
