@@ -158,6 +158,10 @@ public static class RdpDiagnosticReport
             }
         }
         builder.AppendLine($"Port: {(identity.Port == 3389 ? "default" : "custom (number omitted)")}");
+        if (snapshot.ServerAuthentication is { } serverAuthentication)
+        {
+            builder.AppendLine($"Server authentication: {serverAuthentication.Describe()}");
+        }
         builder.AppendLine($"User name provided: {(string.IsNullOrWhiteSpace(identity.Username) ? "No" : "Yes")}");
         builder.AppendLine($"Message: {Redact(snapshot.Message, identity)}");
         if (!string.IsNullOrWhiteSpace(snapshot.Detail) && snapshot.Detail != snapshot.Message)

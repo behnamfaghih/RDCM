@@ -1,4 +1,5 @@
 using System.Windows;
+using System.Windows.Automation;
 using System.Windows.Controls;
 using System.Windows.Forms.Integration;
 using System.Windows.Media;
@@ -40,6 +41,7 @@ public partial class SessionView : System.Windows.Controls.UserControl
     public void Apply(RdpSessionSnapshot snapshot)
     {
         _snapshot = snapshot;
+        ApplyServerAuthentication(snapshot.ServerAuthentication);
         var indicator = SessionIndicator.For(snapshot.State);
         StateDot.Tag = indicator;
         StatusTextBlock.SetResourceReference(TextBlock.ForegroundProperty,
@@ -48,13 +50,14 @@ public partial class SessionView : System.Windows.Controls.UserControl
             ? Visibility.Visible
             : Visibility.Collapsed;
 
-        var connected = snapshot.State == RdpSessionState.Connected;
+        // The native surface stays up while the control auto-reconnects, so keyboard focus survives the interruption.
+        var showSession = snapshot.State is RdpSessionState.Connected or RdpSessionState.AutoReconnecting;
         if (_host is not null)
         {
-            _host.Visibility = connected ? Visibility.Visible : Visibility.Hidden;
+            _host.Visibility = showSession ? Visibility.Visible : Visibility.Hidden;
         }
-        StatePanel.Visibility = connected ? Visibility.Collapsed : Visibility.Visible;
-        if (!connected)
+        StatePanel.Visibility = showSession ? Visibility.Collapsed : Visibility.Visible;
+        if (!showSession)
         {
             ShowStatePanel(snapshot);
         }
@@ -87,13 +90,13 @@ public partial class SessionView : System.Windows.Controls.UserControl
             case RdpSessionState.Reconnecting:
                 title = $"Reconnecting to {name}";
                 message = endpoint;
-                hint = snapshot.NativeDialogOpen ? "Close the Windows Security window to continue." : null;
+                hint = snapshot.NativeDialogOpen ? "Close the Windows Security window to continue." : snapshot.Detail;
                 canCancel = true;
                 break;
             case RdpSessionState.Disconnecting:
                 title = snapshot.Message;
                 message = endpoint;
-                hint = snapshot.NativeDialogOpen ? "Close the Windows Security window to finish." : null;
+                hint = snapshot.NativeDialogOpen ? "Close the Windows Security window to finish." : snapshot.Detail;
                 break;
             case RdpSessionState.Failed:
                 var category = snapshot.Failure?.Category
@@ -124,15 +127,33 @@ public partial class SessionView : System.Windows.Controls.UserControl
         StateHint.Visibility = hint is null ? Visibility.Collapsed : Visibility.Visible;
         PanelPrimaryButton.Content = primaryLabel;
         PanelPrimaryButton.Visibility = canRetry ? Visibility.Visible : Visibility.Collapsed;
-        PanelCloseButton.Visibility = canRetry ? Visibility.Visible : Visibility.Collapsed;
+        // While Remote Desktop finishes its own reconnect attempts, closing the tab is the way to end them at once.
+        var canClose = canRetry || snapshot.AutoReconnectEnding;
+        PanelCloseButton.Visibility = canClose ? Visibility.Visible : Visibility.Collapsed;
         PanelCancelButton.Visibility = canCancel ? Visibility.Visible : Visibility.Collapsed;
-        StateActions.Visibility = canRetry || canCancel ? Visibility.Visible : Visibility.Collapsed;
+        StateActions.Visibility = canRetry || canCancel || canClose ? Visibility.Visible : Visibility.Collapsed;
         PanelCopyButton.Visibility = failed ? Visibility.Visible : Visibility.Collapsed;
         ResetCopyButton();
     }
 
     /// <summary>Raised with a short message for the application status bar.</summary>
     public event Action<string>? StatusMessage;
+
+    // Never hidden while it applies: Remote Desktop won't warn if the server isn't the intended computer.
+    private void ApplyServerAuthentication(ServerAuthenticationStatus? status)
+    {
+        var weakened = status?.IsWeakened == true;
+        ServerIdentityChip.Visibility = weakened ? Visibility.Visible : Visibility.Collapsed;
+        if (!weakened)
+        {
+            return;
+        }
+        var explanation = status!.Source == ServerAuthenticationSource.MachinePolicy
+            ? "A policy on this PC (\"Configure server authentication for client\") lets Remote Desktop connect even when it can't verify the server's identity, so you won't be warned if this isn't the computer you intended. Ask your administrator if you need server authentication."
+            : "Remote Desktop didn't apply RDCM's request to verify the server's identity, so you might not be warned if this isn't the computer you intended.";
+        ServerIdentityChip.ToolTip = explanation;
+        AutomationProperties.SetHelpText(ServerIdentityChip, explanation);
+    }
 
     private void PanelCopyButton_Click(object sender, RoutedEventArgs e)
     {
@@ -194,5 +215,6 @@ public partial class SessionView : System.Windows.Controls.UserControl
         ReconnectButton.Content = compact ? null : "Reconnect";
         DisconnectButton.Content = compact ? null : "Disconnect";
         ProfileChangedText.Visibility = width < NarrowWidth ? Visibility.Collapsed : Visibility.Visible;
+        ServerIdentityText.Visibility = width < NarrowWidth ? Visibility.Collapsed : Visibility.Visible;
     }
 }

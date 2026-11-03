@@ -72,7 +72,7 @@ public sealed class ProfileStore
             File.WriteAllText(temporaryPath, JsonSerializer.Serialize(profiles, JsonOptions));
             if (File.Exists(FilePath) && !RecoveredFromBackup)
             {
-                File.Copy(FilePath, BackupPath, overwrite: true);
+                TransientFileRetry.Run(() => File.Copy(FilePath, BackupPath, overwrite: true));
             }
             else if (File.Exists(FilePath) && RecoveredFromBackup)
             {
@@ -81,15 +81,12 @@ public sealed class ProfileStore
                 PreservedCorruptPath = preservedPath;
             }
 
-            File.Move(temporaryPath, FilePath, overwrite: true);
+            TransientFileRetry.Run(() => File.Move(temporaryPath, FilePath, overwrite: true));
             RecoveredFromBackup = false;
         }
         finally
         {
-            if (File.Exists(temporaryPath))
-            {
-                File.Delete(temporaryPath);
-            }
+            TransientFileRetry.TryDelete(temporaryPath);
         }
     }
 

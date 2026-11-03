@@ -19,7 +19,7 @@ public static class SessionIndicator
     {
         RdpSessionState.Connected => Connected,
         RdpSessionState.Created or RdpSessionState.Connecting or RdpSessionState.Reconnecting
-            or RdpSessionState.Disconnecting => Busy,
+            or RdpSessionState.Disconnecting or RdpSessionState.AutoReconnecting => Busy,
         RdpSessionState.Failed => Failed,
         _ => Idle
     };

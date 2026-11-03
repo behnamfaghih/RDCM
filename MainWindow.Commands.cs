@@ -403,7 +403,7 @@ public partial class MainWindow
     {
         RdpSessionState.Created or RdpSessionState.Connecting => "Connecting",
         RdpSessionState.Connected => "Connected",
-        RdpSessionState.Reconnecting => "Reconnecting",
+        RdpSessionState.Reconnecting or RdpSessionState.AutoReconnecting => "Reconnecting",
         RdpSessionState.Disconnecting => "Disconnecting",
         RdpSessionState.Failed => "Failed",
         _ => "Disconnected"

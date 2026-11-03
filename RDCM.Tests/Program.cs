@@ -2,6 +2,16 @@ using System.IO;
 using RDCM;
 
 var testCount = 0;
+var failedTests = new List<string>();
+string? currentTest = null;
+// A crash on another thread (or an exception nobody observed) is reported with the check that was running.
+AppDomain.CurrentDomain.UnhandledException += (_, args) =>
+    Console.WriteLine($"CRASH while '{currentTest ?? "(between checks)"}' ran, on another thread: {Describe(args.ExceptionObject as Exception)}");
+TaskScheduler.UnobservedTaskException += (_, args) =>
+{
+    failedTests.Add($"unobserved task exception (last check: {currentTest ?? "none"})");
+    Console.WriteLine($"FAIL unobserved task exception: {Describe(args.Exception)}");
+};
 Run("profile validation accepts a valid profile", () =>
 {
     Assert(ProfileValidation.Validate(Profile("Admin"), []) is null);
@@ -112,7 +122,29 @@ Run("profile store saves, recovers a backup, and preserves corrupt source", () =
 RunLifecycleTests();
 RunPreferenceTests();
 RunFeatureTests();
-Console.WriteLine($"Passed {testCount} RDCM checks.");
+// Runner self-test (opt-in): proves failures and crashes are reported with context rather than lost.
+switch (Environment.GetEnvironmentVariable("RDCM_TESTS_SELF_TEST"))
+{
+    case "failure":
+        Run("self-test: injected failure is reported", () => throw new IOException(Path.Combine(Path.GetTempPath(), "injected.json")));
+        break;
+    case "crash":
+        currentTest = "self-test: injected background crash";
+        var crash = new Thread(() => throw new InvalidOperationException("injected background crash"));
+        crash.Start();
+        crash.Join();
+        break;
+}
+GC.Collect();
+GC.WaitForPendingFinalizers();
+if (failedTests.Count == 0)
+{
+    Console.WriteLine($"Passed {testCount} RDCM checks.");
+    return 0;
+}
+Console.WriteLine($"FAILED {failedTests.Count} of {testCount + failedTests.Count} RDCM checks (test host process {Environment.ProcessId}, exit code 1):");
+failedTests.ForEach(name => Console.WriteLine($"  - {name}"));
+return 1;
 
 // ---------------------------------------------------------------------------------------------
 // Search, command palette, shortcuts, diagnostics, duplication, and single instance
@@ -281,6 +313,39 @@ void RunFeatureTests()
         Assert(report.Contains("computer \"<host>\"") && !report.Contains("\"db\"") && !report.Contains("jsmith") && !report.Contains("Payroll"));
         var defaultPort = RdpDiagnosticReport.Build(snapshot with { Identity = local }, DateTimeOffset.UnixEpoch, "1.0.0", "Windows 11");
         Assert(defaultPort.Contains("Port: default") && !defaultPort.Contains("3389"));
+    });
+
+    Run("server authentication: a policy overrides the requested level; weaker checks are flagged", () =>
+    {
+        var warn = ServerAuthenticationMode.WarnIfUnverified;
+        // Observed on the test workstation: policy 0 ("Always connect"), control rejects the write and reads back 0.
+        var policyOff = ServerAuthentication.Evaluate(warn, controlReadBack: 0, machinePolicy: 0);
+        Assert(policyOff is { Effective: ServerAuthenticationMode.Off, Source: ServerAuthenticationSource.MachinePolicy, IsWeakened: true });
+        Assert(policyOff.Describe().Contains("policy"));
+        Assert(ServerAuthentication.Evaluate(warn, 0, machinePolicy: 1) is { Effective: ServerAuthenticationMode.Required, IsWeakened: false });
+        Assert(ServerAuthentication.Evaluate(warn, 0, machinePolicy: 2) is { Effective: ServerAuthenticationMode.WarnIfUnverified, IsWeakened: false });
+        Assert(ServerAuthentication.Evaluate(warn, 2, machinePolicy: null) is { Source: ServerAuthenticationSource.Application, IsWeakened: false });
+        Assert(ServerAuthentication.Evaluate(warn, 0, machinePolicy: null) is { Source: ServerAuthenticationSource.Unexplained, IsWeakened: true });
+        Assert(ServerAuthentication.Evaluate(warn, null, machinePolicy: null) is { Effective: null, IsWeakened: true });
+        // An out-of-range policy value isn't a documented setting, so the control's read-back decides.
+        Assert(ServerAuthentication.Evaluate(warn, 2, machinePolicy: 7) is { Source: ServerAuthenticationSource.Application, IsWeakened: false });
+    });
+
+    Run("server authentication: each attempt publishes what applies, and diagnostics include it", () =>
+    {
+        var (controller, client, _) = Lifecycle();
+        client.ServerAuthentication = ServerAuthentication.Evaluate(ServerAuthenticationMode.WarnIfUnverified, 0, 0);
+        controller.Start();
+        Assert(controller.Snapshot.ServerAuthentication is { IsWeakened: true, Source: ServerAuthenticationSource.MachinePolicy });
+        var report = RdpDiagnosticReport.Build(controller.Snapshot, DateTimeOffset.UnixEpoch, "1.0.0", "Windows");
+        Assert(report.Contains("Server authentication: Off: a policy on this PC"));
+
+        controller.OnNativeConnecting();
+        client.State = RdpConnectionController.NativeNotConnected;
+        controller.OnNativeDisconnected(260);
+        client.ServerAuthentication = ServerAuthentication.Evaluate(ServerAuthenticationMode.WarnIfUnverified, 2, null);
+        controller.Reconnect();
+        Assert(controller.Snapshot.ServerAuthentication is { IsWeakened: false, Source: ServerAuthenticationSource.Application });
     });
 
     Run("key routing: keys from the session host are left to the remote session", () =>
@@ -641,6 +706,26 @@ void RunLifecycleTests()
         Assert(controller.State == RdpSessionState.Disconnected && client.DisconnectCalls == 2);
     });
 
+    // Observed live (guided run 1): the operator's Cancel in the Windows Security window ended the attempt with reason
+    // 0x1F07 (7943), which the control has no description for. Reason 1 comes only from RDCM's own disconnect.
+    Run("lifecycle (observed live): Cancel in the Windows Security window (0x1F07) is a cancellation, not a failure", () =>
+    {
+        var (controller, client, _) = Lifecycle();
+        controller.Start();
+        controller.OnNativeConnecting();
+        controller.OnNativeDialogShown();
+        controller.OnNativeDialogClosed();
+        client.State = RdpConnectionController.NativeNotConnected;
+        controller.OnNativeDisconnected(7943);
+        Assert(controller.Snapshot is { State: RdpSessionState.Disconnected, EndReason: RdpEndReason.ConnectionCancelled, Failure: null });
+        Assert(controller.Snapshot.Message == "Connection cancelled" && !controller.HasActiveSession);
+        // In an attempt without a sign-in window the same code is an error that keeps its number.
+        Assert(controller.Reconnect() && client.ConnectCalls == 2);
+        controller.OnNativeConnecting();
+        controller.OnNativeDisconnected(7943);
+        Assert(controller.Snapshot is { State: RdpSessionState.Failed, EndReason: RdpEndReason.ConnectFailed, Failure.Reason: 7943 });
+    });
+
     Run("lifecycle: after the sign-in prompt closes, the teardown timeout applies again", () =>
     {
         var (controller, client, clock) = Lifecycle();
@@ -697,6 +782,273 @@ void RunLifecycleTests()
         controller.OnNativeDisconnected(1);
         Assert(controller.Snapshot is { State: RdpSessionState.Disconnected, NativeDialogOpen: false } && !controller.NativeDialogOpen);
     });
+
+    // Auto-reconnect: event semantics from IMsTscAxEvents::OnAutoReconnecting2 / OnAutoReconnected (fake control).
+    Run("auto-reconnect: progress is shown, the watchdog waits, and success restores the session", () =>
+    {
+        var (controller, client, clock) = Connected();
+        client.State = RdpConnectionController.NativeNotConnected;
+        controller.OnNativeAutoReconnecting(2308, networkAvailable: true, attempt: 1, maxAttempts: 5);
+        Assert(controller.Snapshot is { State: RdpSessionState.AutoReconnecting, AutoReconnect: { Attempt: 1, MaxAttempts: 5 } });
+        Assert(controller.Snapshot.Message.Contains("attempt 1 of 5") && controller.HasActiveSession);
+        // A "not connected" reading is not evidence that the session ended while the control reconnects.
+        for (var i = 0; i < 20; i++)
+        {
+            clock.Advance(RdpConnectionController.EventGraceMs);
+            controller.Poll();
+        }
+        Assert(controller.State == RdpSessionState.AutoReconnecting && client.DisconnectCalls == 0);
+        controller.OnNativeAutoReconnecting(2308, true, 2, 5);
+        Assert(controller.Snapshot.AutoReconnect is { Attempt: 2 });
+        client.State = RdpConnectionController.NativeConnected;
+        controller.OnNativeAutoReconnected();
+        Assert(controller.Snapshot is { State: RdpSessionState.Connected, AutoReconnect: null, EndReason: RdpEndReason.None });
+        Assert(client.ConnectCalls == 1);
+    });
+
+    Run("auto-reconnect: when the control gives up, the session is lost with the attempt count", () =>
+    {
+        var (controller, client, _) = Connected();
+        controller.OnNativeAutoReconnecting(2308, true, 5, 5);
+        client.State = RdpConnectionController.NativeNotConnected;
+        controller.OnNativeDisconnected(264);
+        Assert(controller.Snapshot is { State: RdpSessionState.Failed, EndReason: RdpEndReason.ConnectionLost, AutoReconnect: null });
+        Assert(controller.Snapshot.Detail!.Contains("tried to reconnect 5 times") && controller.Snapshot.Failure!.Category == RdpFailureCategory.TimedOut);
+
+        // Observed live: the last notification before giving up is numbered one past the maximum (6 of 5).
+        (controller, client, _) = Connected();
+        controller.OnNativeAutoReconnecting(516, true, 5, 5);
+        controller.OnNativeAutoReconnecting(516, true, 6, 5);
+        Assert(controller.Snapshot.AutoReconnect is { Attempt: 5, MaxAttempts: 5 });
+        client.State = RdpConnectionController.NativeNotConnected;
+        controller.OnNativeDisconnected(516);
+        Assert(controller.Snapshot is { State: RdpSessionState.Failed, EndReason: RdpEndReason.ConnectionLost } &&
+               controller.Snapshot.Detail!.Contains("tried to reconnect 5 times"));
+    });
+
+    Run("auto-reconnect: without the stop answer (controls that don't ask), Disconnect is requested instead", () =>
+    {
+        var (controller, client, _) = Connected();
+        client.State = RdpConnectionController.NativeNotConnected;
+        controller.OnNativeAutoReconnecting(2308, true, 1, 5);
+        Assert(controller.Disconnect());
+        Assert(controller.State == RdpSessionState.Disconnecting && client.DisconnectCalls == 1);
+        controller.OnNativeAutoReconnecting(2308, true, 2, 5);
+        Assert(controller.State == RdpSessionState.Disconnecting);
+        controller.OnNativeDisconnected(1);
+        Assert(controller.Snapshot is { State: RdpSessionState.Disconnected, EndReason: RdpEndReason.UserDisconnected });
+        // A late restore is ended from Poll, outside the native callback.
+        client.State = RdpConnectionController.NativeConnected;
+        controller.OnNativeAutoReconnected();
+        Assert(controller.State == RdpSessionState.Disconnected && client.DisconnectCalls == 1 && controller.HasPendingWork);
+        controller.Poll();
+        Assert(client.DisconnectCalls == 2 && !controller.HasPendingWork);
+    });
+
+    // Observed live (guided run 1): Disconnect() during auto-reconnect was ignored; ~30 s later the control restored the
+    // session behind a "Remote Desktop problem" panel, and later Disconnect() calls had no effect either.
+    Run("auto-reconnect (observed live): Disconnect stops the control at its next attempt, without calling Disconnect()", () =>
+    {
+        var (controller, client, clock) = Connected();
+        // Live, the Connected property stays 1 while the control reconnects.
+        Assert(controller.OnNativeAutoReconnectDecision(1));
+        controller.OnNativeAutoReconnecting(2308, true, 1, 5);
+        Assert(controller.State == RdpSessionState.AutoReconnecting);
+        Assert(controller.Disconnect());
+        Assert(controller.State == RdpSessionState.Disconnecting && client.DisconnectCalls == 0);
+        Assert(controller.Snapshot.Detail!.Contains("Close the tab to end it now") && controller.Snapshot.AutoReconnectEnding);
+        // Live, the next attempt came ~26 s later, past the normal disconnect timeout, which must not fire meanwhile.
+        for (var i = 0; i < 15; i++)
+        {
+            clock.Advance(2_000);
+            controller.Poll();
+        }
+        Assert(controller.State == RdpSessionState.Disconnecting && client.DisconnectCalls == 0);
+        Assert(!controller.OnNativeAutoReconnectDecision(2));
+        controller.OnNativeAutoReconnecting(516, true, 2, 5);
+        clock.Advance(1_000);
+        controller.Poll();
+        Assert(controller.State == RdpSessionState.Disconnecting && client.DisconnectCalls == 0);
+        client.State = RdpConnectionController.NativeNotConnected;
+        controller.OnNativeDisconnected(516);
+        Assert(controller.Snapshot is { State: RdpSessionState.Disconnected, EndReason: RdpEndReason.UserDisconnected, Failure: null });
+        Assert(client.DisconnectCalls == 0 && client.ConnectCalls == 1 && !controller.Snapshot.AutoReconnectEnding);
+    });
+
+    Run("auto-reconnect (observed live): a session restored after the user disconnected is ended again from Poll", () =>
+    {
+        var (controller, client, _) = Connected();
+        Assert(controller.OnNativeAutoReconnectDecision(1));
+        controller.OnNativeAutoReconnecting(2308, true, 1, 5);
+        controller.Disconnect();
+        // The attempt already under way succeeds once the network is back.
+        controller.OnNativeAutoReconnected();
+        Assert(controller.State == RdpSessionState.Disconnecting && client.DisconnectCalls == 0 && controller.HasPendingWork);
+        controller.Poll();
+        Assert(client.DisconnectCalls == 1 && !controller.HasPendingWork);
+        client.State = RdpConnectionController.NativeNotConnected;
+        controller.OnNativeDisconnected(1);
+        Assert(controller.Snapshot is { State: RdpSessionState.Disconnected, EndReason: RdpEndReason.UserDisconnected });
+    });
+
+    Run("auto-reconnect: Reconnect while reconnecting stops the control first, then starts a fresh attempt", () =>
+    {
+        var (controller, client, _) = Connected();
+        Assert(controller.OnNativeAutoReconnectDecision(1));
+        controller.OnNativeAutoReconnecting(2308, true, 1, 5);
+        Assert(controller.Reconnect());
+        Assert(controller.State == RdpSessionState.Reconnecting && client.DisconnectCalls == 0 && client.ConnectCalls == 1);
+        Assert(!controller.OnNativeAutoReconnectDecision(2));
+        client.State = RdpConnectionController.NativeNotConnected;
+        controller.OnNativeDisconnected(516);
+        Assert(controller.HasPendingWork);
+        controller.Poll();
+        Assert(controller.State == RdpSessionState.Connecting && client.ConnectCalls == 2 && client.DisconnectCalls == 0);
+    });
+
+    Run("auto-reconnect: the user's choice holds if the control never reaches another attempt or keeps asking", () =>
+    {
+        var (controller, client, clock) = Connected();
+        Assert(controller.OnNativeAutoReconnectDecision(1));
+        controller.OnNativeAutoReconnecting(2308, true, 1, 5);
+        controller.Disconnect();
+        clock.Advance(RdpConnectionController.AutoReconnectSilenceTimeoutMs);
+        controller.Poll();
+        Assert(controller.Snapshot is { State: RdpSessionState.Failed, EndReason: RdpEndReason.ControlError } && client.DisconnectCalls == 0);
+        Assert(!controller.OnNativeAutoReconnectDecision(2) && !controller.OnNativeAutoReconnectDecision(3));
+        // While it keeps reporting attempts it is only answered "stop"; once silent for the safety-net time, it is
+        // released with Disconnect() instead.
+        controller.Poll();
+        Assert(client.DisconnectCalls == 0);
+        clock.Advance(RdpConnectionController.AutoReconnectSilenceTimeoutMs);
+        controller.Poll();
+        Assert(client.DisconnectCalls == 1);
+        controller.Shutdown();
+        Assert(!controller.OnNativeAutoReconnectDecision(4));
+    });
+
+    // Observed live (guided run 2, before the binding fix): the stop answer was lost and the control kept reconnecting
+    // at ~26 s intervals, then restored the session once the network returned; the restore was disconnected at once.
+    Run("auto-reconnect (observed live): a stop the control doesn't honour at once doesn't become an error", () =>
+    {
+        var (controller, client, clock) = Connected();
+        Assert(controller.OnNativeAutoReconnectDecision(1));
+        controller.OnNativeAutoReconnecting(2308, true, 1, 5);
+        controller.Disconnect();
+        for (var attempt = 2; attempt <= 4; attempt++)
+        {
+            clock.Advance(26_000);
+            controller.Poll();
+            controller.OnNativeAutoReconnecting(516, true, attempt, 5);
+            Assert(!controller.OnNativeAutoReconnectDecision(attempt));
+            controller.Poll();
+            Assert(controller.State == RdpSessionState.Disconnecting && client.DisconnectCalls == 0);
+        }
+        controller.OnNativeAutoReconnected();
+        controller.Poll();
+        Assert(client.DisconnectCalls == 1);
+        client.State = RdpConnectionController.NativeNotConnected;
+        controller.OnNativeDisconnected(1);
+        Assert(controller.Snapshot is { State: RdpSessionState.Disconnected, EndReason: RdpEndReason.UserDisconnected, Failure: null });
+    });
+
+    Run("auto-reconnect: the event sink writes 'stop' to both possible positions of the control's answer", () =>
+    {
+        var keep = true;
+        var asked = new List<int>();
+        var sink = new RdpClientEventSink(_ => { }, attempt => { asked.Add(attempt); return keep; });
+        // Live layout: the [out] status (0 = continue automatically) comes first, the disconnect reason last.
+        int first = 0, last = 2308;
+        sink.OnAutoReconnecting(ref first, 1, ref last);
+        Assert(first == 0 && last == 2308);
+        keep = false;
+        sink.OnAutoReconnecting(ref first, 2, ref last);
+        Assert(first == RdpClientEventSink.AutoReconnectContinueStop && last == RdpClientEventSink.AutoReconnectContinueStop);
+        Assert(asked.SequenceEqual([1, 2]));
+    });
+
+    Run("auto-reconnect: a silent control is resolved by the safety net, not left reconnecting forever", () =>
+    {
+        var (controller, client, clock) = Connected();
+        client.State = RdpConnectionController.NativeNotConnected;
+        controller.OnNativeAutoReconnecting(2308, false, 1, 5);
+        clock.Advance(RdpConnectionController.AutoReconnectSilenceTimeoutMs - 1);
+        controller.Poll();
+        Assert(controller.State == RdpSessionState.AutoReconnecting);
+        clock.Advance(1);
+        controller.Poll();
+        Assert(controller.Snapshot is { State: RdpSessionState.Failed, EndReason: RdpEndReason.ConnectionLost });
+
+        // Live, the Connected property reads 1 throughout auto-reconnect, so it isn't evidence of a restored session:
+        // fail closed and release the control.
+        (controller, client, clock) = Connected();
+        Assert(controller.OnNativeAutoReconnectDecision(1));
+        controller.OnNativeAutoReconnecting(2308, true, 1, 5);
+        clock.Advance(RdpConnectionController.AutoReconnectSilenceTimeoutMs);
+        controller.Poll();
+        Assert(controller.Snapshot is { State: RdpSessionState.Failed, EndReason: RdpEndReason.ConnectionLost } && client.DisconnectCalls == 1);
+        Assert(!controller.OnNativeAutoReconnectDecision(2));
+    });
+
+    Run("auto-reconnect: events outside a connected session are ignored; odd progress values aren't shown", () =>
+    {
+        var (controller, client, _) = Lifecycle();
+        controller.Start();
+        controller.OnNativeConnecting();
+        controller.OnNativeAutoReconnecting(2308, true, 1, 5);
+        Assert(controller.State == RdpSessionState.Connecting);
+        controller.Disconnect();
+        controller.OnNativeAutoReconnecting(2308, true, 1, 5);
+        Assert(controller.State == RdpSessionState.Disconnecting);
+
+        (controller, _, _) = Connected();
+        controller.OnNativeAutoReconnecting(2308, true, attempt: 7, maxAttempts: 5);
+        Assert(controller.Snapshot.AutoReconnect is { Attempt: null, MaxAttempts: null } && controller.Snapshot.Message.Contains("attempting to reconnect"));
+        Assert(SessionIndicator.For(RdpSessionState.AutoReconnecting) == SessionIndicator.Busy);
+    });
+
+    Run("session view: while auto-reconnect ends, the panel explains the wait and offers Close tab", () =>
+    {
+        Exception? failure = null;
+        var thread = new Thread(() =>
+        {
+            try
+            {
+                if (System.Windows.Application.Current is null)
+                {
+                    var app = new System.Windows.Application { ShutdownMode = System.Windows.ShutdownMode.OnExplicitShutdown };
+                    app.Resources.MergedDictionaries.Add(new System.Windows.ResourceDictionary
+                    {
+                        Source = new Uri("pack://application:,,,/RDCM;component/Themes/Controls.xaml")
+                    });
+                }
+                var view = new SessionView();
+                var element = (string name) => (System.Windows.FrameworkElement)view.FindName(name);
+                var ending = new RdpSessionSnapshot(1, RdpSessionState.Disconnecting, RdpEndReason.None, "Disconnecting…",
+                    "Remote Desktop is still trying to restore the connection… Close the tab to end it now.",
+                    SessionIdentity.Capture(Profile("View")), AutoReconnectEnding: true);
+                view.Apply(ending);
+                Assert(element("PanelCloseButton").Visibility == System.Windows.Visibility.Visible &&
+                       element("StateActions").Visibility == System.Windows.Visibility.Visible);
+                Assert(((System.Windows.Controls.TextBlock)element("StateHint")).Text.Contains("Close the tab"));
+                view.Apply(ending with { Sequence = 2, Detail = null, AutoReconnectEnding = false });
+                Assert(element("PanelCloseButton").Visibility == System.Windows.Visibility.Collapsed &&
+                       element("StateActions").Visibility == System.Windows.Visibility.Collapsed &&
+                       element("StateHint").Visibility == System.Windows.Visibility.Collapsed);
+            }
+            catch (Exception exception)
+            {
+                failure = exception;
+            }
+        });
+        thread.SetApartmentState(ApartmentState.STA);
+        thread.Start();
+        thread.Join();
+        if (failure is not null)
+        {
+            throw failure;
+        }
+    });
 }
 
 (RdpConnectionController Controller, FakeRdpClient Client, ManualClock Clock) Lifecycle(bool events = true)
@@ -727,6 +1079,88 @@ void RunLifecycleTests()
 
 void RunPreferenceTests()
 {
+    Run("storage: transient lock failures are retried with a bounded back-off; others are not", () =>
+    {
+        var waits = new List<int>();
+        var calls = 0;
+        TransientFileRetry.Run(() =>
+        {
+            if (++calls <= 3) throw new UnauthorizedAccessException("locked");
+        }, waits.Add);
+        Assert(calls == 4 && waits.SequenceEqual([25, 50, 75]));
+
+        calls = 0;
+        waits.Clear();
+        AssertThrows<IOException>(() => TransientFileRetry.Run(() => { calls++; throw new IOException("sharing violation"); }, waits.Add));
+        Assert(calls == TransientFileRetry.Attempts && waits.Sum() < 500);
+
+        calls = 0;
+        AssertThrows<FileNotFoundException>(() => TransientFileRetry.Run(() => { calls++; throw new FileNotFoundException(); }, waits.Add));
+        Assert(calls == 1);
+    });
+
+    // Reproduces the cause of the earlier one-off crash: another process (an antivirus scanner or the indexer)
+    // has the file open while it is replaced, which fails with "access denied" on NTFS.
+    Run("storage: profiles and settings save once a brief external file lock is released", () =>
+    {
+        var directory = Path.Combine(Path.GetTempPath(), "RDCM.Tests", Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(directory);
+        try
+        {
+            var store = new ProfileStore(Path.Combine(directory, "connections.json"));
+            store.Save([Profile("Before")]);
+            var settingsStore = new AppSettingsStore(Path.Combine(directory, "settings.json"));
+            settingsStore.Save(new AppSettings());
+
+            foreach (var file in new[] { store.FilePath, settingsStore.FilePath })
+            {
+                var holder = new FileStream(file, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete);
+                var probe = file + ".probe";
+                File.WriteAllText(probe, "[]");
+                AssertThrowsAny(() => File.Move(probe, file, overwrite: true), typeof(UnauthorizedAccessException), typeof(IOException));
+                File.Delete(probe);
+                var release = Task.Run(async () => { await Task.Delay(60); holder.Dispose(); });
+                if (file == store.FilePath)
+                {
+                    store.Save([Profile("After")]);
+                }
+                else
+                {
+                    settingsStore.Save(new AppSettings { CompactConnectionList = true });
+                }
+                release.Wait();
+            }
+            Assert(new ProfileStore(store.FilePath).Load().Single().Name == "After");
+            Assert(settingsStore.Load().CompactConnectionList);
+            Assert(!Directory.EnumerateFiles(directory, "*.tmp").Any());
+        }
+        finally
+        {
+            Directory.Delete(directory, recursive: true);
+        }
+    });
+
+    Run("storage: a file that stays locked still fails visibly and keeps the previous content", () =>
+    {
+        var directory = Path.Combine(Path.GetTempPath(), "RDCM.Tests", Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(directory);
+        try
+        {
+            var store = new ProfileStore(Path.Combine(directory, "connections.json"));
+            store.Save([Profile("Kept")]);
+            using (new FileStream(store.FilePath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete))
+            {
+                AssertThrowsAny(() => store.Save([Profile("Lost")]), typeof(UnauthorizedAccessException), typeof(IOException));
+            }
+            Assert(new ProfileStore(store.FilePath).Load().Single().Name == "Kept");
+            Assert(!Directory.EnumerateFiles(directory, "*.tmp").Any());
+        }
+        finally
+        {
+            Directory.Delete(directory, recursive: true);
+        }
+    });
+
     Run("settings: normalize repairs nulls, duplicates, and invalid values", () =>
     {
         var id = Guid.NewGuid();
@@ -826,9 +1260,46 @@ void RunPreferenceTests()
 
 void Run(string name, Action test)
 {
-    test();
-    testCount++;
-    Console.WriteLine($"PASS {name}");
+    currentTest = name;
+    try
+    {
+        test();
+        testCount++;
+        Console.WriteLine($"PASS {name}");
+    }
+    catch (Exception exception)
+    {
+        // Reported, not swallowed: the run continues so every failure is visible, and the exit code is 1.
+        failedTests.Add(name);
+        Console.WriteLine($"FAIL {name}");
+        Console.WriteLine($"  {Describe(exception)}");
+    }
+    finally
+    {
+        currentTest = null;
+    }
+}
+
+// Exception type, message, and stack with local profile paths replaced. Tests use placeholder data only.
+static string Describe(Exception? exception)
+{
+    if (exception is null)
+    {
+        return "(no exception object)";
+    }
+    var text = $"{exception.GetType().FullName}: {exception.Message}{Environment.NewLine}{exception.StackTrace}";
+    foreach (var (path, placeholder) in new[]
+             {
+                 (Path.GetTempPath().TrimEnd('\\'), "%TEMP%"),
+                 (Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), "%USERPROFILE%")
+             })
+    {
+        if (!string.IsNullOrEmpty(path))
+        {
+            text = text.Replace(path, placeholder, StringComparison.OrdinalIgnoreCase);
+        }
+    }
+    return text.Replace(Environment.NewLine, Environment.NewLine + "    ");
 }
 
 static ConnectionProfile Profile(string name) => new()
@@ -860,6 +1331,19 @@ static void AssertThrows<TException>(Action action) where TException : Exception
     throw new InvalidOperationException($"Expected {typeof(TException).Name}.");
 }
 
+static void AssertThrowsAny(Action action, params Type[] accepted)
+{
+    try
+    {
+        action();
+    }
+    catch (Exception exception) when (accepted.Any(type => type.IsInstanceOfType(exception)))
+    {
+        return;
+    }
+    throw new InvalidOperationException($"Expected one of: {string.Join(", ", accepted.Select(type => type.Name))}.");
+}
+
 /// <summary>Scriptable stand-in for the Remote Desktop ActiveX control.</summary>
 sealed class FakeRdpClient : IRdpNativeClient
 {
@@ -873,11 +1357,16 @@ sealed class FakeRdpClient : IRdpNativeClient
 
     public int ReadConnectionState() => State;
 
-    public void BeginConnect(SessionIdentity identity)
+    /// <summary>What the fake reports as in effect for the next connection (default: the requested level applies).</summary>
+    public ServerAuthenticationStatus ServerAuthentication { get; set; } =
+        RDCM.ServerAuthentication.Evaluate(RDCM.ServerAuthentication.RequestedMode, (int)RDCM.ServerAuthentication.RequestedMode, null);
+
+    public ServerAuthenticationStatus BeginConnect(SessionIdentity identity)
     {
         ConnectCalls++;
         LastIdentity = identity;
         State = RdpConnectionController.NativeConnecting;
+        return ServerAuthentication;
     }
 
     public void RequestDisconnect()

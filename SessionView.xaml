@@ -27,7 +27,22 @@
                            TextTrimming="CharacterEllipsis" Margin="0,0,12,0"
                            ToolTip="{Binding Text, RelativeSource={RelativeSource Self}}" />
 
-                <Border x:Name="ProfileChangedChip" Grid.Column="2" Visibility="Collapsed"
+                <StackPanel Grid.Column="2" Orientation="Horizontal" VerticalAlignment="Center">
+                <Border x:Name="ServerIdentityChip" Visibility="Collapsed"
+                        BorderBrush="{DynamicResource WarningBrush}" BorderThickness="1"
+                        CornerRadius="{StaticResource ControlCornerRadius}" Padding="7,2,8,2" Margin="0,0,12,0"
+                        VerticalAlignment="Center" Focusable="True" KeyboardNavigation.IsTabStop="True"
+                        FocusVisualStyle="{StaticResource FocusRingInset}"
+                        AutomationProperties.Name="Server identity not verified">
+                    <StackPanel Orientation="Horizontal">
+                        <local:Glyph Style="{StaticResource IconGlyph}" Text="&#xE7BA;" FontSize="12"
+                                   Foreground="{DynamicResource WarningBrush}" />
+                        <TextBlock x:Name="ServerIdentityText" Text="Server identity not verified"
+                                   FontSize="{StaticResource FontSizeCaption}" Margin="6,0,0,0"
+                                   Foreground="{DynamicResource WarningBrush}" VerticalAlignment="Center" />
+                    </StackPanel>
+                </Border>
+                <Border x:Name="ProfileChangedChip" Visibility="Collapsed"
                         BorderBrush="{DynamicResource WarningBrush}" BorderThickness="1"
                         CornerRadius="{StaticResource ControlCornerRadius}" Padding="7,2,8,2" Margin="0,0,12,0"
                         VerticalAlignment="Center"
@@ -41,6 +56,7 @@
                                    Foreground="{DynamicResource WarningBrush}" VerticalAlignment="Center" />
                     </StackPanel>
                 </Border>
+                </StackPanel>
 
                 <StackPanel Grid.Column="3" Orientation="Horizontal" VerticalAlignment="Center">
                     <TextBlock x:Name="ResolutionLabel" Text="Resolution" Style="{StaticResource CaptionText}"

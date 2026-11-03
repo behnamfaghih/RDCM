@@ -9,7 +9,10 @@ public enum RdpSessionState
     Disconnected,
     Reconnecting,
     Failed,
-    Disposed
+    Disposed,
+
+    /// <summary>The network dropped and Remote Desktop is restoring the same session by itself (native auto-reconnect).</summary>
+    AutoReconnecting
 }
 
 public sealed class RdpSessionModel(SessionIdentity identity)
@@ -19,7 +22,8 @@ public sealed class RdpSessionModel(SessionIdentity identity)
         {
             [RdpSessionState.Created] = [RdpSessionState.Connecting, RdpSessionState.Disconnecting, RdpSessionState.Disposed],
             [RdpSessionState.Connecting] = [RdpSessionState.Connected, RdpSessionState.Disconnecting, RdpSessionState.Disconnected, RdpSessionState.Reconnecting, RdpSessionState.Failed, RdpSessionState.Disposed],
-            [RdpSessionState.Connected] = [RdpSessionState.Disconnecting, RdpSessionState.Disconnected, RdpSessionState.Reconnecting, RdpSessionState.Failed, RdpSessionState.Disposed],
+            [RdpSessionState.Connected] = [RdpSessionState.Disconnecting, RdpSessionState.Disconnected, RdpSessionState.Reconnecting, RdpSessionState.Failed, RdpSessionState.AutoReconnecting, RdpSessionState.Disposed],
+            [RdpSessionState.AutoReconnecting] = [RdpSessionState.Connected, RdpSessionState.Disconnecting, RdpSessionState.Disconnected, RdpSessionState.Reconnecting, RdpSessionState.Failed, RdpSessionState.Disposed],
             [RdpSessionState.Disconnecting] = [RdpSessionState.Disconnected, RdpSessionState.Reconnecting, RdpSessionState.Failed, RdpSessionState.Disposed],
             [RdpSessionState.Disconnected] = [RdpSessionState.Connecting, RdpSessionState.Reconnecting, RdpSessionState.Disconnecting, RdpSessionState.Disposed],
             [RdpSessionState.Reconnecting] = [RdpSessionState.Disconnecting, RdpSessionState.Connecting, RdpSessionState.Failed, RdpSessionState.Disconnected, RdpSessionState.Disposed],
@@ -31,7 +35,7 @@ public sealed class RdpSessionModel(SessionIdentity identity)
     public RdpSessionState State { get; private set; } = RdpSessionState.Created;
 
     public bool HasActiveSession => State is RdpSessionState.Connecting or RdpSessionState.Connected
-        or RdpSessionState.Disconnecting or RdpSessionState.Reconnecting;
+        or RdpSessionState.Disconnecting or RdpSessionState.Reconnecting or RdpSessionState.AutoReconnecting;
 
     public void TransitionTo(RdpSessionState state)
     {

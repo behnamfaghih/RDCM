@@ -127,14 +127,11 @@ public sealed class AppSettingsStore
         try
         {
             File.WriteAllText(temporaryPath, JsonSerializer.Serialize(settings, JsonOptions));
-            File.Move(temporaryPath, FilePath, overwrite: true);
+            TransientFileRetry.Run(() => File.Move(temporaryPath, FilePath, overwrite: true));
         }
         finally
         {
-            if (File.Exists(temporaryPath))
-            {
-                File.Delete(temporaryPath);
-            }
+            TransientFileRetry.TryDelete(temporaryPath);
         }
     }
 

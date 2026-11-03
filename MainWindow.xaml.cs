@@ -528,6 +528,7 @@ public partial class MainWindow : Window, INotifyPropertyChanged
         }
 
         var previousState = tab.Snapshot?.State;
+        var previousServerAuthentication = tab.Snapshot?.ServerAuthentication;
         tab.Snapshot = snapshot;
         if (snapshot.Identity != tab.Identity)
         {
@@ -561,8 +562,9 @@ public partial class MainWindow : Window, INotifyPropertyChanged
             _allowClose = true;
             Dispatcher.BeginInvoke(Close, System.Windows.Threading.DispatcherPriority.Background);
         }
-        if (snapshot.State == RdpSessionState.Connected && previousState != RdpSessionState.Connected)
+        if (snapshot.State == RdpSessionState.Connected && previousState is not (RdpSessionState.Connected or RdpSessionState.AutoReconnecting))
         {
+            // A session restored by auto-reconnect isn't a new connection.
             RecordRecentConnection(snapshot.Identity.ProfileId);
         }
         if (WorkspaceTabs.SelectedItem == tab.Container)
@@ -570,11 +572,17 @@ public partial class MainWindow : Window, INotifyPropertyChanged
             StatusText.Text = $"{tab.Identity.Name} ({tab.Identity.Address}): {snapshot.Message}";
         }
         else if (previousState != snapshot.State &&
-                 (snapshot.State == RdpSessionState.Failed ||
+                 (snapshot.State is RdpSessionState.Failed or RdpSessionState.AutoReconnecting ||
                   (snapshot.State == RdpSessionState.Disconnected && snapshot.EndReason == RdpEndReason.RemoteEnded)))
         {
-            // Without this, a failure in a background tab is only visible as a small dot in its header.
+            // Without this, a failure or interruption in a background tab is only visible as a small dot in its header.
             StatusText.Text = $"{tab.Identity.Name} (background tab): {snapshot.Message}";
+        }
+        if (snapshot.ServerAuthentication is { IsWeakened: true } weakened && weakened != previousServerAuthentication)
+        {
+            StatusText.Text = weakened.Source == ServerAuthenticationSource.MachinePolicy
+                ? $"{tab.Identity.Name}: server identity isn't verified because a policy on this PC turns that check off"
+                : $"{tab.Identity.Name}: server identity isn't verified";
         }
     }
 
@@ -733,7 +741,7 @@ public partial class MainWindow : Window, INotifyPropertyChanged
 
     private static bool CanDisconnect(RdpSessionState state) =>
         state is RdpSessionState.Created or RdpSessionState.Connecting or RdpSessionState.Connected
-            or RdpSessionState.Reconnecting;
+            or RdpSessionState.Reconnecting or RdpSessionState.AutoReconnecting;
 
     private static System.Windows.Controls.MenuItem CreateMenuItem(
         string text,

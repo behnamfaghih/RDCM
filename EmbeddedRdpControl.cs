@@ -120,7 +120,7 @@ public sealed class EmbeddedRdpControl : AxHost
         try
         {
             var ocx = GetOcx() ?? throw new InvalidOperationException("The Remote Desktop control was not created.");
-            _eventCookie = new ConnectionPointCookie(ocx, new RdpClientEventSink(DispatchNativeEvent), typeof(IMsTscAxEvents));
+            _eventCookie = new ConnectionPointCookie(ocx, new RdpClientEventSink(DispatchNativeEvent, ContinueAutoReconnect), typeof(IMsTscAxEvents));
             _controller.NativeEventsAvailable = true;
         }
         catch (Exception exception) when (exception is not OutOfMemoryException)
@@ -189,6 +189,28 @@ public sealed class EmbeddedRdpControl : AxHost
         if (_controller.HasPendingWork && IsHandleCreated)
         {
             BeginInvoke(new Action(Poll));
+        }
+    }
+
+    /// <summary>Answers the control's OnAutoReconnecting question synchronously. Fails closed (stop) on any error.</summary>
+    private bool ContinueAutoReconnect(int attempt)
+    {
+        if (_disposed)
+        {
+            return false;
+        }
+        try
+        {
+            return _controller.OnNativeAutoReconnectDecision(attempt);
+        }
+        catch (Exception exception) when (exception is not OutOfMemoryException)
+        {
+            AppLog.Error("Deciding whether Remote Desktop may keep reconnecting failed; it is asked to stop.", exception);
+            return false;
+        }
+        finally
+        {
+            UpdatePolling();
         }
     }
 
@@ -416,7 +438,7 @@ public sealed class EmbeddedRdpControl : AxHost
         public int ReadConnectionState() =>
             Invoke(client => (int)client.Connected, "Couldn't read the connection state");
 
-        public void BeginConnect(SessionIdentity identity) => Invoke(client =>
+        public ServerAuthenticationStatus BeginConnect(SessionIdentity identity) => Invoke(client =>
         {
             client.Server = identity.Host.Trim().TrimStart('[').TrimEnd(']');
             client.UserName = identity.Username.Trim();
@@ -426,10 +448,22 @@ public sealed class EmbeddedRdpControl : AxHost
             owner._requestedDesktopSize = (width, height);
             client.AdvancedSettings9.RDPPort = identity.Port;
             client.AdvancedSettings9.EnableCredSspSupport = true;
-            client.AdvancedSettings9.AuthenticationLevel = 2;
+            // The control returns S_FALSE (not an error) when a policy overrides this, so read back what applies.
+            client.AdvancedSettings9.AuthenticationLevel = (uint)ServerAuthentication.RequestedMode;
+            int? readBack;
+            try
+            {
+                readBack = (int)(uint)client.AdvancedSettings9.AuthenticationLevel;
+            }
+            catch (Exception exception) when (exception is COMException or RuntimeBinderException or InvalidCastException)
+            {
+                AppLog.Warning("The server authentication level couldn't be read back.", exception);
+                readBack = null;
+            }
             client.AdvancedSettings9.SmartSizing = true;
+            var status = ServerAuthentication.Evaluate(ServerAuthentication.RequestedMode, readBack, ServerAuthentication.ReadMachinePolicy());
             client.Connect();
-            return 0;
+            return status;
         }, "Remote Desktop couldn't start the connection");
 
         public void RequestDisconnect() => Invoke(client =>

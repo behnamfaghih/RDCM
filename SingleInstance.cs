@@ -39,7 +39,10 @@ public sealed class SingleInstanceGuard : IDisposable
         return $@"Local\RDCM.{hash}";
     }
 
-    /// <summary>Brings the other instance's window to the front. Returns false when no window was found.</summary>
+    /// <summary>
+    /// Brings the other instance's window to the front. Returns false when no window was found or it couldn't be
+    /// shown: Windows doesn't let a normal process restore an elevated process's minimized window (observed live).
+    /// </summary>
     public static bool ActivateExistingInstance()
     {
         using var current = Process.GetCurrentProcess();
@@ -61,7 +64,8 @@ public sealed class SingleInstanceGuard : IDisposable
                     ShowWindow(window, ShowWindowRestore);
                 }
                 // A process started by the user may hand the foreground to another window.
-                return SetForegroundWindow(window);
+                var foreground = SetForegroundWindow(window);
+                return foreground && !IsIconic(window);
             }
         }
         return false;
