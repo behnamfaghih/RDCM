@@ -1279,6 +1279,158 @@ void RunLifecycleTests()
             throw failure;
         }
     });
+
+    Run("session view: hiding the session leaves keyboard focus on the session's tab, not on the released remote desktop", () =>
+    {
+        Exception? failure = null;
+        var thread = new Thread(() =>
+        {
+            try
+            {
+                if (System.Windows.Application.Current is null)
+                {
+                    var app = new System.Windows.Application { ShutdownMode = System.Windows.ShutdownMode.OnExplicitShutdown };
+                    app.Resources.MergedDictionaries.Add(new System.Windows.ResourceDictionary
+                    {
+                        Source = new Uri("pack://application:,,,/RDCM;component/Themes/Controls.xaml")
+                    });
+                }
+                var identity = SessionIdentity.Capture(Profile("Focus"));
+                (SessionView View, EmbeddedRdpControl Session, System.Windows.Forms.Integration.WindowsFormsHost Host) Create()
+                {
+                    var session = new EmbeddedRdpControl(identity);
+                    var host = new System.Windows.Forms.Integration.WindowsFormsHost { Child = session };
+                    var view = new SessionView();
+                    view.AttachSession(session, host);
+                    return (view, session, host);
+                }
+                var connected = new RdpSessionSnapshot(1, RdpSessionState.Connected, RdpEndReason.None, "Connected", null, identity);
+                var disconnecting = connected with { Sequence = 2, State = RdpSessionState.Disconnecting, Message = "Disconnecting…" };
+
+                // In a tab (as in MainWindow) of a window that isn't active (it is never shown here): the window's remembered
+                // focus becomes the session's tab, so activating it doesn't send keys to a released remote desktop.
+                var (view, session, host) = Create();
+                var tab = new System.Windows.Controls.TabItem { Header = "Focus", Content = view };
+                var tabs = new System.Windows.Controls.TabControl { Items = { tab } };
+                var window = new System.Windows.Window { Content = tabs, ShowActivated = false };
+                view.Apply(connected);
+                System.Windows.Input.FocusManager.SetFocusedElement(window, host);
+                view.Apply(disconnecting);
+                Assert(ReferenceEquals(System.Windows.Input.FocusManager.GetFocusedElement(window), tab));
+
+                // Focus the user had moved to another RDCM control is left alone.
+                var search = new System.Windows.Controls.TextBox();
+                var (view2, session2, host2) = Create();
+                var window2 = new System.Windows.Window
+                {
+                    Content = new System.Windows.Controls.StackPanel { Children = { search, new System.Windows.Controls.TabControl { Items = { new System.Windows.Controls.TabItem { Content = view2 } } } } }
+                };
+                view2.Apply(connected);
+                System.Windows.Input.FocusManager.SetFocusedElement(window2, search);
+                view2.Apply(disconnecting);
+                Assert(ReferenceEquals(System.Windows.Input.FocusManager.GetFocusedElement(window2), search));
+
+                // Outside a tab the release-keyboard button is the target.
+                var (view3, session3, host3) = Create();
+                var window3 = new System.Windows.Window { Content = view3 };
+                view3.Apply(connected);
+                view3.Apply(disconnecting);
+                Assert(ReferenceEquals(System.Windows.Input.FocusManager.GetFocusedElement(window3), view3.FindName("AppControlsButton")));
+
+                foreach (var item in new System.IDisposable[] { session, host, session2, host2, session3, host3 })
+                {
+                    item.Dispose();
+                }
+                window.Close();
+                window2.Close();
+                window3.Close();
+            }
+            catch (Exception exception)
+            {
+                failure = exception;
+            }
+        });
+        thread.SetApartmentState(ApartmentState.STA);
+        thread.Start();
+        thread.Join();
+        if (failure is not null)
+        {
+            throw failure;
+        }
+    });
+
+    Run("session view: the real Remote Desktop control's window is shown when the session appears (it is created hidden)", () =>
+    {
+        Exception? failure = null;
+        var thread = new Thread(() =>
+        {
+            try
+            {
+                if (System.Windows.Application.Current is null)
+                {
+                    var app = new System.Windows.Application { ShutdownMode = System.Windows.ShutdownMode.OnExplicitShutdown };
+                    app.Resources.MergedDictionaries.Add(new System.Windows.ResourceDictionary
+                    {
+                        Source = new Uri("pack://application:,,,/RDCM;component/Themes/Controls.xaml")
+                    });
+                }
+                static void Pump()
+                {
+                    var frame = new System.Windows.Threading.DispatcherFrame();
+                    System.Windows.Threading.Dispatcher.CurrentDispatcher.BeginInvoke(
+                        System.Windows.Threading.DispatcherPriority.ApplicationIdle, () => frame.Continue = false);
+                    System.Windows.Threading.Dispatcher.PushFrame(frame);
+                }
+                var identity = SessionIdentity.Capture(Profile("Surface"));
+                var session = new EmbeddedRdpControl(identity);
+                var host = new System.Windows.Forms.Integration.WindowsFormsHost { Child = session };
+                var view = new SessionView();
+                view.AttachSession(session, host);
+                // Shown off-screen and never activated; showing it creates the native control while the surface is hidden.
+                var window = new System.Windows.Window
+                {
+                    Content = view, Width = 900, Height = 600, Left = -32000, Top = -32000, ShowActivated = false, ShowInTaskbar = false,
+                    WindowStartupLocation = System.Windows.WindowStartupLocation.Manual
+                };
+                window.Show();
+                var activeX = IntPtr.Zero;
+                for (var attempt = 0; attempt < 50 && activeX == IntPtr.Zero; attempt++)
+                {
+                    Pump();
+                    activeX = session.IsHandleCreated ? TestWindows.FindChild(session.Handle, "ATL:") : IntPtr.Zero;
+                }
+                Assert(activeX != IntPtr.Zero);
+
+                var connected = new RdpSessionSnapshot(1, RdpSessionState.Connected, RdpEndReason.None, "Connected", null, identity);
+                view.Apply(connected);
+                Pump();
+                Assert(TestWindows.HasVisibleStyle(activeX) && TestWindows.IsWindowVisible(activeX));
+
+                // Hidden while disconnecting, shown again on the next connection, and nothing takes keyboard focus.
+                view.Apply(connected with { Sequence = 2, State = RdpSessionState.Disconnecting, Message = "Disconnecting…" });
+                Pump();
+                Assert(!TestWindows.IsWindowVisible(activeX));
+                view.Apply(connected with { Sequence = 3 });
+                Pump();
+                Assert(TestWindows.IsWindowVisible(activeX) && !session.ContainsFocus);
+
+                session.Dispose();
+                host.Dispose();
+                window.Close();
+            }
+            catch (Exception exception)
+            {
+                failure = exception;
+            }
+        });
+        thread.SetApartmentState(ApartmentState.STA);
+        thread.Start();
+        thread.Join();
+        if (failure is not null)
+        {
+            System.Runtime.ExceptionServices.ExceptionDispatchInfo.Capture(failure).Throw();
+        }
+    });
 }
 
 (RdpConnectionController Controller, FakeRdpClient Client, ManualClock Clock) Lifecycle(bool events = true)
@@ -1811,4 +1963,42 @@ sealed class ManualClock
     private long _now = 1_000;
     public long Now() => _now;
     public void Advance(long milliseconds) => _now += milliseconds;
+}
+
+static class TestWindows
+{
+    private delegate bool EnumProc(IntPtr hwnd, IntPtr parameter);
+
+    [System.Runtime.InteropServices.DllImport("user32.dll")]
+    private static extern bool EnumChildWindows(IntPtr parent, EnumProc callback, IntPtr parameter);
+
+    [System.Runtime.InteropServices.DllImport("user32.dll", CharSet = System.Runtime.InteropServices.CharSet.Unicode)]
+    private static extern int GetClassName(IntPtr hwnd, System.Text.StringBuilder name, int capacity);
+
+    [System.Runtime.InteropServices.DllImport("user32.dll")]
+    private static extern int GetWindowLong(IntPtr hwnd, int index);
+
+    [System.Runtime.InteropServices.DllImport("user32.dll")]
+    public static extern bool IsWindowVisible(IntPtr hwnd);
+
+    /// <summary>The first descendant window whose class name starts with the prefix.</summary>
+    public static IntPtr FindChild(IntPtr parent, string classPrefix)
+    {
+        var found = IntPtr.Zero;
+        EnumChildWindows(parent, (hwnd, _) =>
+        {
+            var name = new System.Text.StringBuilder(256);
+            GetClassName(hwnd, name, name.Capacity);
+            if (!name.ToString().StartsWith(classPrefix, StringComparison.Ordinal))
+            {
+                return true;
+            }
+            found = hwnd;
+            return false;
+        }, IntPtr.Zero);
+        return found;
+    }
+
+    /// <summary>The window's own WS_VISIBLE style, regardless of its parents.</summary>
+    public static bool HasVisibleStyle(IntPtr hwnd) => (GetWindowLong(hwnd, -16) & 0x10000000) != 0;
 }

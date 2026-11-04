@@ -77,6 +77,7 @@ public partial class MainWindow : Window, INotifyPropertyChanged
         UpdateSelectionCommands();
         RegisterCommands();
         PreviewKeyDown += MainWindow_PreviewKeyDown;
+        WorkspaceTabs.GotKeyboardFocus += WorkspaceTabs_GotKeyboardFocus;
         Loaded += (_, _) => Dispatcher.BeginInvoke(ShowStartupNotices, System.Windows.Threading.DispatcherPriority.ContextIdle);
         // WPF does not raise live-region events by itself; announce status changes explicitly.
         System.ComponentModel.DependencyPropertyDescriptor
@@ -806,6 +807,26 @@ public partial class MainWindow : Window, INotifyPropertyChanged
         SessionSummaryText.Text = Tabs.Count == 0
             ? "No open sessions"
             : $"{Tabs.Count} session{(Tabs.Count == 1 ? "" : "s")} · {connected} connected";
+    }
+
+    /// <summary>
+    /// WPF falls back to the tab control itself when the focused control becomes unavailable, for example the Disconnect
+    /// button after it is pressed. The selected session tab is the useful place: its accessible name says which session
+    /// it is and its state, and Tab and the arrow keys continue from there.
+    /// </summary>
+    private void WorkspaceTabs_GotKeyboardFocus(object sender, KeyboardFocusChangedEventArgs e)
+    {
+        if (!ReferenceEquals(e.NewFocus, WorkspaceTabs))
+        {
+            return;
+        }
+        Dispatcher.BeginInvoke(() =>
+        {
+            if (ReferenceEquals(Keyboard.FocusedElement, WorkspaceTabs) && WorkspaceTabs.SelectedItem is TabItem { IsEnabled: true } item)
+            {
+                item.Focus();
+            }
+        }, System.Windows.Threading.DispatcherPriority.Input);
     }
 
     private void WorkspaceTabs_SelectionChanged(object sender, SelectionChangedEventArgs e)

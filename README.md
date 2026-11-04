@@ -2,7 +2,21 @@
 
 RDCM is a Windows WPF manager for saved Remote Desktop (RDP) connection profiles. Connect directly from RDCM and view each remote desktop in its own in-app workspace tab, powered by the Windows Remote Desktop ActiveX control. RDCM does not launch the separate `mstsc.exe` client.
 
-## Run
+## Install
+
+Download `RDCM-<version>-win-x64.msi` and open it. RDCM installs for your Windows account only, without administrator rights, into `%LOCALAPPDATA%\Programs\RDCM`, and adds **RDCM - Remote Connection Manager** to the Start menu (no desktop shortcut) and to **Settings > Apps > Installed apps**. Nothing else on the computer changes: no services, firewall rules, saved credentials, or policies.
+
+Requirements: 64-bit Windows 10 or 11 with the built-in Remote Desktop client (`mstscax.dll`), and the **.NET 10 Desktop Runtime (x64)** from <https://dotnet.microsoft.com/download/dotnet/10.0>. The installer checks for the runtime first and stops with a message if it's missing.
+
+- **Upgrade**: open the newer MSI. If RDCM is running, the installer asks you to close it; **Ignore** asks RDCM to close itself (it asks before disconnecting open sessions and is never forcibly terminated). Installing an older version over a newer one is refused with an explanation. If an upgrade fails or is cancelled, the previous version stays installed and working. Rarely, a failure at the very end leaves an extra entry for the version that failed in **Installed apps**, because Windows Installer can't remove a per-user registration without administrator rights; uninstall that entry, and the working version stays in place.
+- **Repair**: in Control Panel > **Programs and Features**, right-click RDCM and choose **Repair** to restore missing or damaged program files.
+- **Uninstall**: **Settings > Apps > Installed apps > RDCM - Remote Connection Manager > Uninstall** removes the program files, the shortcut, and the installer's own registry key (`HKCU\Software\RDCM\Installer`).
+
+Your connection profiles and preferences (`%LOCALAPPDATA%\RDCM`: `connections.json`, its `.bak` backup, and `settings.json`) are never created, changed, or deleted by installing, upgrading, repairing, or uninstalling, so a reinstall picks them up again. Delete that folder yourself to remove them.
+
+A build that isn't code-signed shows a Windows SmartScreen warning when opened. Only choose **More info > Run anyway** for an MSI you got from a source you trust.
+
+## Build and run from source
 
 Open `RDCM.csproj` in Visual Studio, or run:
 
@@ -10,7 +24,13 @@ Open `RDCM.csproj` in Visual Studio, or run:
 dotnet run --project .\RDCM.csproj
 ```
 
-Requires Windows, the .NET 10 SDK, and the registered Windows Remote Desktop ActiveX component (`mstscax.dll`).
+Requires Windows, the .NET 10 SDK, and the registered Windows Remote Desktop ActiveX component (`mstscax.dll`). To build the installer (WiX Toolset v7 is restored from NuGet; see [Releasing](#releasing)):
+
+```powershell
+dotnet build .\installer\RDCM.Installer.wixproj -c Release
+```
+
+The MSI is written to `installer\bin\x64\Release\RDCM-<version>-win-x64.msi`.
 
 ## Profiles and credentials
 
@@ -71,4 +91,28 @@ Run the built-in, dependency-free model and persistence checks with:
 dotnet run --project .\RDCM.Tests\RDCM.Tests.csproj
 ```
 
-These tests do not contact an RDP host. They cover profile validation, immutable session identity, state transitions, the connection lifecycle (using a scripted fake of the Remote Desktop control: cancellation, retries, reconnects, stale events, failures, shutdown), automatic reconnection (progress, recovery, exhaustion, the safety net, and the event sink's answer), replacing the control on Disconnect or Reconnect during auto-reconnect (release order, exactly one fresh control, stale events from released controls, sign-in windows, close and exit during the replacement, creation and release failures, and 100 replace-and-reconnect cycles), server-authentication evaluation and reporting, retried saves while another program holds a file, settings normalization and migration, recent-connection bookkeeping, window placement validation, legacy profile loading, corrupt-file backup recovery, multi-word search and ranking, the command palette filter, shortcut routing rules, failure classification, diagnostic redaction, duplicate naming, the single-instance guard, the sign-in-dialog sequences observed against a real server (connect, cancel in the Windows Security window, cancel during sign-in, disconnect and reconnect), key routing from the session area, and the absence of password or credential fields in saved data. The runner reports every failing check (and any unhandled exception with the check that was running) and exits with a non-zero code on failure.
+These tests do not contact an RDP host. They cover profile validation, immutable session identity, state transitions, the connection lifecycle (using a scripted fake of the Remote Desktop control: cancellation, retries, reconnects, stale events, failures, shutdown), automatic reconnection (progress, recovery, exhaustion, the safety net, and the event sink's answer), replacing the control on Disconnect or Reconnect during auto-reconnect (release order, exactly one fresh control, stale events from released controls, sign-in windows, close and exit during the replacement, creation and release failures, and 100 replace-and-reconnect cycles), server-authentication evaluation and reporting, retried saves while another program holds a file, settings normalization and migration, recent-connection bookkeeping, window placement validation, legacy profile loading, corrupt-file backup recovery, multi-word search and ranking, the command palette filter, shortcut routing rules, failure classification, diagnostic redaction, duplicate naming, the single-instance guard, the sign-in-dialog sequences observed against a real server (connect, cancel in the Windows Security window, cancel during sign-in, disconnect and reconnect), key routing from the session area, keyboard focus leaving a session as it is hidden, the real Remote Desktop control's window being shown when a session appears (the control is created while hidden), and the absence of password or credential fields in saved data. The runner reports every failing check (and any unhandled exception with the check that was running) and exits with a non-zero code on failure.
+
+## Releasing
+
+1. **Version.** Set `<Version>` in `Directory.Build.props`, the only place it is defined; the executable, **Copy details**, the MSI, and Add/Remove Programs all use it. The product name, publisher, and copyright are there too. Every release needs a higher `major.minor.patch` version. Never change only a fourth part: Windows Installer ignores it, so `1.0.0.1` and `1.0.0` count as the same version and either one silently replaces the other (same-version rebuilds are allowed), with no downgrade protection in either direction.
+2. **Build** the MSI (see above). The build always republishes RDCM from clean for win-x64 (framework-dependent), fails if the publish output gains or loses a file compared with the reviewed list (`RdcmShippedFile` in `installer\RDCM.Installer.wixproj`), and runs Windows Installer validation. Two builds of the same commit contain identical program files; the MSI files differ only in their generated product and package codes and timestamps.
+3. **Sign** (when a code-signing certificate is available). No certificate, key, or password belongs in this repository.
+
+   ```powershell
+   dotnet build .\installer\RDCM.Installer.wixproj -c Release -p:SigningCertificateThumbprint=<SHA-1 thumbprint> -p:TimestampUrl=<RFC 3161 timestamp URL>
+   ```
+
+   `RDCM.exe` and `RDCM.dll` are signed before they are packaged, then the MSI is signed, each with SHA-256 and a timestamp (so signatures stay valid after the certificate expires), and each signature is checked with `signtool verify /pa`. `signtool.exe` comes from the Windows SDK; pass `-p:SignToolPath=<path>` if it isn't on `PATH`. Publicly trusted code-signing keys must be kept on a hardware token or in a cloud signing service (for example Azure Artifact Signing); the certificate then appears in the current user's certificate store through its provider. New certificates, including EV, start without SmartScreen reputation; it builds up as signed releases are downloaded.
+4. **Test the MSI** before publishing it: a clean install, an upgrade from the previous release with profiles present, uninstall (profiles kept) and reinstall, an older version being refused, an upgrade while RDCM is running, and a connection to a real server from the installed build.
+5. **Publish** the MSI with its SHA-256 hash.
+
+Rules for `installer\Package.wxs`:
+
+- Never change the `UpgradeCode`; it identifies RDCM across versions.
+- Upgrades install the new version first and remove the previous one afterwards (`afterInstallFinalize`). A per-user install has no administrator rights, and Windows Installer can't roll back product registration in that mode, so removing the previous version first would leave it orphaned (files without an Add/Remove Programs entry) whenever an upgrade failed.
+- Because both versions are briefly installed together, every file has its own component. Never change a component's GUID while its file keeps its name and folder; give a new file a new component with a new GUID; when a file is dropped, delete its component, and the file is removed with the previous version.
+- During an upgrade, files of an equal version are replaced too (`REINSTALLMODE` `emus`), so a rebuilt package of the same version installs its own binaries.
+- Keep user data out of the package: nothing in `%LOCALAPPDATA%\RDCM` may be authored, so installs, upgrades, and uninstalls never touch it.
+
+The installer is built with WiX Toolset v7: `WixToolset.Sdk` (its version is fixed by the `Sdk="WixToolset.Sdk/7.0.1"` attribute in the project file; NuGet lock files don't cover MSBuild SDKs, so its hash isn't verified) and `WixToolset.Util.wixext` and `WixToolset.Netfx.wixext` (versions and hashes pinned in `installer\packages.lock.json`). Their binaries are provided under the Open Source Maintenance Fee EULA, accepted in the project file (`AcceptEula`). That fee applies to revenue-generating use by organisations with an annual gross revenue of US$10,000 or more; check whether it applies before distributing commercially. The MSI includes WiX's own custom-action binaries (closing a running RDCM and checking for the .NET runtime), which the licence allows to be redistributed with its notices. RDCM itself has no NuGet runtime dependencies.

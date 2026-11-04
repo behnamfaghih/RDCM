@@ -54,15 +54,10 @@ public partial class SessionView : System.Windows.Controls.UserControl
         var showSession = snapshot.State is RdpSessionState.Connected or RdpSessionState.AutoReconnecting;
         if (_host is not null)
         {
-            if (!showSession && SessionHasKeyboardFocus(_host))
+            if (!showSession)
             {
-                // Keys must not keep going to a hidden (or released, or replaced) remote desktop window. If the window
-                // isn't active WPF can't take Win32 focus now; the button then becomes the element focused on activation.
-                if (!AppControlsButton.Focus())
-                {
-                    System.Windows.Input.FocusManager.SetFocusedElement(
-                        System.Windows.Input.FocusManager.GetFocusScope(AppControlsButton), AppControlsButton);
-                }
+                // Keys must not keep going to a hidden (or released, or replaced) remote desktop window.
+                MoveFocusOutOfSession(_host);
             }
             _host.Visibility = showSession ? Visibility.Visible : Visibility.Hidden;
         }
@@ -147,7 +142,39 @@ public partial class SessionView : System.Windows.Controls.UserControl
     /// <summary>Raised with a short message for the application status bar.</summary>
     public event Action<string>? StatusMessage;
 
-    /// <summary>WPF focus or Win32 focus (the remote desktop's own input window) is inside the session host.</summary>
+    /// <summary>
+    /// Where keyboard focus goes when the remote desktop is hidden while it has focus: the session's tab (its accessible
+    /// name says which session and its state, and Tab and the arrow keys continue from there), or the release-keyboard
+    /// button when the view isn't in a tab.
+    /// </summary>
+    internal UIElement FocusTargetWhenSessionHides =>
+        System.Windows.LogicalTreeHelper.GetParent(this) is TabItem { IsEnabled: true } tab ? tab : AppControlsButton;
+
+    private void MoveFocusOutOfSession(WindowsFormsHost host)
+    {
+        if (Window.GetWindow(this) is not { } window)
+        {
+            return;
+        }
+        var target = FocusTargetWhenSessionHides;
+        if (window.IsActive && SessionHasKeyboardFocus(host) && target.Focus())
+        {
+            return;
+        }
+        // An inactive window restores its last focused element when it is activated again; that must not be the session.
+        var scope = System.Windows.Input.FocusManager.GetFocusScope(target);
+        if (System.Windows.Input.FocusManager.GetFocusedElement(scope) is not DependencyObject remembered ||
+            ReferenceEquals(remembered, host) || (remembered is Visual visual && visual.IsDescendantOf(host)))
+        {
+            System.Windows.Input.FocusManager.SetFocusedElement(scope, target);
+        }
+    }
+
+    /// <summary>
+    /// The remote desktop (or anything else in the session host) has keyboard focus. Its input window can belong to another
+    /// thread, which GetFocus doesn't report, so the foreground thread's focus is checked too; WPF itself then reports no
+    /// focused element.
+    /// </summary>
     private static bool SessionHasKeyboardFocus(WindowsFormsHost host)
     {
         if (host.IsKeyboardFocusWithin)
@@ -155,9 +182,39 @@ public partial class SessionView : System.Windows.Controls.UserControl
             return true;
         }
         var root = host.Handle;
-        var focus = GetFocus();
-        return root != IntPtr.Zero && focus != IntPtr.Zero && (focus == root || IsChild(root, focus));
+        if (root == IntPtr.Zero)
+        {
+            return false;
+        }
+        bool Inside(IntPtr window) => window != IntPtr.Zero && (window == root || IsChild(root, window));
+        if (Inside(GetFocus()))
+        {
+            return true;
+        }
+        var info = new GuiThreadInfo { Size = System.Runtime.InteropServices.Marshal.SizeOf<GuiThreadInfo>() };
+        return GetGUIThreadInfo(0, ref info) && Inside(info.Focus);
     }
+
+    [System.Runtime.InteropServices.StructLayout(System.Runtime.InteropServices.LayoutKind.Sequential)]
+    private struct GuiThreadInfo
+    {
+        public int Size;
+        public int Flags;
+        public IntPtr Active;
+        public IntPtr Focus;
+        public IntPtr Capture;
+        public IntPtr MenuOwner;
+        public IntPtr MoveSize;
+        public IntPtr Caret;
+        public int CaretLeft;
+        public int CaretTop;
+        public int CaretRight;
+        public int CaretBottom;
+    }
+
+    [System.Runtime.InteropServices.DllImport("user32.dll")]
+    [return: System.Runtime.InteropServices.MarshalAs(System.Runtime.InteropServices.UnmanagedType.Bool)]
+    private static extern bool GetGUIThreadInfo(uint threadId, ref GuiThreadInfo info);
 
     [System.Runtime.InteropServices.DllImport("user32.dll")]
     private static extern IntPtr GetFocus();

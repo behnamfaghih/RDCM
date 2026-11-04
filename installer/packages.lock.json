@@ -1,0 +1,19 @@
+{
+  "version": 1,
+  "dependencies": {
+    "native,Version=v0.0": {
+      "WixToolset.Netfx.wixext": {
+        "type": "Direct",
+        "requested": "[7.0.1, )",
+        "resolved": "7.0.1",
+        "contentHash": "uI5EhFLDGUleRJiVorYkmPq3z5nzcUPTrs12bJwok1q1FIceST3gFVS29sRpz+1uKvSnP5RfIdlowngd/qwTrQ=="
+      },
+      "WixToolset.Util.wixext": {
+        "type": "Direct",
+        "requested": "[7.0.1, )",
+        "resolved": "7.0.1",
+        "contentHash": "xJkQvpxQT6kcXnSbkUy6qQs741DxzIkzlgkVikHc9XzW9uo9dLwGeoO3VUXXX1EwYmraKi5rzb1QcYhl4CUFHg=="
+      }
+    }
+  }
+}

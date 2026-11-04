@@ -1,0 +1,125 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  RDCM per-user MSI (Windows Installer, WiX Toolset v7).
+
+  * Installs for the current user only: %LOCALAPPDATA%\Programs\RDCM, a Start menu shortcut, and an Add/Remove Programs
+    entry. No administrator rights, services, firewall rules, credentials, or policy changes.
+  * User data (%LOCALAPPDATA%\RDCM: connections.json, connections.json.bak, settings.json) is never authored here, so
+    install, upgrade, repair, and uninstall never create, change, or delete it.
+  * Upgrades are major upgrades; installing an older version over a newer one is blocked.
+  * Requires the .NET 10 Desktop Runtime (x64), which is checked before anything is installed.
+-->
+<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs"
+     xmlns:util="http://wixtoolset.org/schemas/v4/wxs/util"
+     xmlns:netfx="http://wixtoolset.org/schemas/v4/wxs/netfx">
+
+  <!-- The UpgradeCode identifies RDCM across all versions. Never change it. -->
+  <Package Name="$(var.ProductName)"
+           Manufacturer="$(var.Manufacturer)"
+           Version="$(var.ProductVersion)"
+           UpgradeCode="D947A4CF-AA53-4997-B8AC-96D8B44CD780"
+           Scope="perUser"
+           Compressed="yes"
+           Language="1033">
+
+    <SummaryInformation Description="$(var.ProductName) $(var.ProductVersion) (per-user, x64)" Manufacturer="$(var.Manufacturer)" />
+
+    <!--
+      Major upgrade: the new version is installed and committed first, and the previous version is removed afterwards
+      (afterInstallFinalize). If the new version fails or is cancelled, the previous version is left installed and
+      registered exactly as it was; if removing the previous version fails, the new version stays installed and working.
+
+      Why not remove the previous version first: a per-user install runs without administrator rights, and Windows
+      Installer cannot roll back a product's registration in that mode (its registration keys are writable only by the
+      Windows Installer service). Unregistering the previous version inside a transaction that then fails would leave it
+      orphaned, with its files but without an Add/Remove Programs entry.
+
+      Because both versions are briefly installed together, Windows Installer component rules must be followed: every
+      file has its own component, a component's GUID never changes while its file keeps its name and location, and a file
+      that is dropped in a later version simply loses its component (it is then removed with the previous version).
+    -->
+    <MajorUpgrade AllowSameVersionUpgrades="yes" Schedule="afterInstallFinalize"
+                  DowngradeErrorMessage="A newer version of [ProductName] is already installed, so this older version can't be installed. To use this version, first uninstall RDCM from Settings &gt; Apps &gt; Installed apps. Your connections and settings are not removed by uninstalling." />
+
+    <MediaTemplate EmbedCab="yes" />
+
+    <!--
+      Rebuilt packages of the same version: Windows Installer replaces a versioned file only with a higher version by
+      default, and the previous version is removed after the new one is installed, so the old RDCM.exe and RDCM.dll would
+      be kept. During an upgrade, files of an equal version are replaced too ("e"; "mus" are the defaults). Every file is
+      private to RDCM's own folder, and repair and uninstall keep the default behaviour.
+    -->
+    <SetProperty Id="REINSTALLMODE" Value="emus" After="FindRelatedProducts" Sequence="execute" Condition="WIX_UPGRADE_DETECTED AND NOT Installed" />
+
+    <!-- .NET 10 Desktop Runtime (x64), resolved the same way RDCM.exe resolves it (minor-version roll-forward). -->
+    <netfx:DotNetCompatibilityCheck Property="RDCM_DESKTOP_RUNTIME" RuntimeType="desktop" Platform="x64" Version="10.0.0" RollForward="minor" />
+    <Launch Condition="Installed OR RDCM_DESKTOP_RUNTIME = &quot;0&quot;"
+            Message="RDCM needs the .NET 10 Desktop Runtime (x64). Install it from https://dotnet.microsoft.com/download/dotnet/10.0 (choose &quot;.NET Desktop Runtime&quot;, x64), then run this installer again." />
+
+    <!--
+      If RDCM is running, the user is asked to close it (Abort / Retry / Ignore). Ignore, or a silent install, sends RDCM a
+      normal close request, which saves its preferences and asks before disconnecting open sessions. RDCM is never
+      terminated; if it is still running after that, Windows Installer finishes the update when the computer restarts.
+    -->
+    <util:CloseApplication Id="CloseRdcm" Target="RDCM.exe" PromptToContinue="yes" CloseMessage="yes" RebootPrompt="no" Timeout="30"
+                           Description="RDCM is running. Close RDCM, then select Retry. (Ignore asks RDCM to close itself; you'll be asked to confirm if remote sessions are open.)" />
+    <!--
+      The extension schedules this check just before InstallFiles, which on uninstall is after RDCM's files have already
+      been removed. Run it before InstallValidate instead, so RDCM is asked to close before any of its files are checked
+      or touched.
+    -->
+    <InstallExecuteSequence>
+      <Custom Action="override Wix4CloseApplications_X64" Before="InstallValidate" Condition="VersionNT &gt; 400" />
+    </InstallExecuteSequence>
+
+    <Icon Id="RDCM.ico" SourceFile="$(var.AssetsDir)\RDCM.ico" />
+    <Property Id="ARPPRODUCTICON" Value="RDCM.ico" />
+    <Property Id="ARPNOMODIFY" Value="1" />
+    <SetProperty Id="ARPINSTALLLOCATION" Value="[INSTALLFOLDER]" After="CostFinalize" />
+
+    <StandardDirectory Id="LocalAppDataFolder">
+      <Directory Id="UserProgramsFolder" Name="Programs">
+        <Directory Id="INSTALLFOLDER" Name="RDCM" />
+      </Directory>
+    </StandardDirectory>
+
+    <!--
+      One component per file (see the MajorUpgrade note). Per-user components use an HKCU value as key path (Windows
+      Installer rules for user-profile locations). The GUIDs below must never change or be reused for another file.
+    -->
+    <ComponentGroup Id="ApplicationFiles" Directory="INSTALLFOLDER">
+      <Component Id="RdcmExe" Guid="8FE254FD-5548-450B-BBAE-3368A1281FC2">
+        <File Id="RdcmExe" Source="$(var.PublishDir)RDCM.exe" />
+        <RegistryValue Root="HKCU" Key="Software\RDCM\Installer" Name="RDCM.exe" Type="integer" Value="1" KeyPath="yes" />
+        <!-- RDCM.exe ships in every version, so this component is removed only when RDCM is uninstalled. -->
+        <RemoveFolder Id="RemoveInstallFolder" Directory="INSTALLFOLDER" On="uninstall" />
+        <RemoveFolder Id="RemoveUserProgramsFolder" Directory="UserProgramsFolder" On="uninstall" />
+        <!-- Removes only the installer's own bookkeeping key; RDCM itself keeps nothing in the registry. -->
+        <RemoveRegistryKey Root="HKCU" Key="Software\RDCM\Installer" Action="removeOnUninstall" />
+      </Component>
+      <Component Id="RdcmDll" Guid="6396275B-8684-41DC-BC95-5B09CEDA5912">
+        <File Id="RdcmDll" Source="$(var.PublishDir)RDCM.dll" />
+        <RegistryValue Root="HKCU" Key="Software\RDCM\Installer" Name="RDCM.dll" Type="integer" Value="1" KeyPath="yes" />
+      </Component>
+      <Component Id="RdcmRuntimeConfig" Guid="EBC9ED52-BD90-4CAF-8755-13935928CD2C">
+        <File Id="RdcmRuntimeConfig" Source="$(var.PublishDir)RDCM.runtimeconfig.json" />
+        <RegistryValue Root="HKCU" Key="Software\RDCM\Installer" Name="RDCM.runtimeconfig.json" Type="integer" Value="1" KeyPath="yes" />
+      </Component>
+      <Component Id="RdcmDeps" Guid="FF254B28-5F2D-4892-8074-9A34CE62E9D9">
+        <File Id="RdcmDeps" Source="$(var.PublishDir)RDCM.deps.json" />
+        <RegistryValue Root="HKCU" Key="Software\RDCM\Installer" Name="RDCM.deps.json" Type="integer" Value="1" KeyPath="yes" />
+      </Component>
+    </ComponentGroup>
+
+    <StandardDirectory Id="ProgramMenuFolder">
+      <Component Id="StartMenuShortcut" Guid="297D6C49-CB90-4BD0-A080-F266E6FBF708">
+        <Shortcut Id="RdcmStartMenuShortcut"
+                  Name="$(var.ProductName)"
+                  Description="Manage saved Remote Desktop connections and open them in tabs"
+                  Target="[INSTALLFOLDER]RDCM.exe"
+                  WorkingDirectory="INSTALLFOLDER" />
+        <RegistryValue Root="HKCU" Key="Software\RDCM\Installer" Name="StartMenuShortcut" Type="integer" Value="1" KeyPath="yes" />
+      </Component>
+    </StandardDirectory>
+  </Package>
+</Wix>

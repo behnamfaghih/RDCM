@@ -158,6 +158,32 @@ public sealed class EmbeddedRdpControl : Panel
         ScheduleFitToTabUpdate();
     }
 
+    /// <summary>
+    /// A control generation's window is created while this panel is hidden (the session surface stays hidden until the
+    /// connection is established, and a replacement is created while the session is ending). AxHost then hides the
+    /// ActiveX window (OLEIVERB_HIDE) and never shows it again when the panel appears, so the remote desktop would stay
+    /// blank until something activated the control. Shows it without activating it, so keyboard focus doesn't move.
+    /// </summary>
+    protected override void OnVisibleChanged(EventArgs e)
+    {
+        base.OnVisibleChanged(e);
+        if (Visible && !_disposed && _slot.Current is { IsHandleCreated: true } native &&
+            (GetWindowLong(native.Handle, GwlStyle) & WsVisible) == 0)
+        {
+            ShowWindow(native.Handle, SwShowNoActivate);
+        }
+    }
+
+    private const int GwlStyle = -16;
+    private const int WsVisible = 0x10000000;
+    private const int SwShowNoActivate = 8;
+
+    [DllImport("user32.dll")]
+    private static extern int GetWindowLong(IntPtr hwnd, int index);
+
+    [DllImport("user32.dll")]
+    private static extern bool ShowWindow(IntPtr hwnd, int command);
+
     private void ScheduleFitToTabUpdate()
     {
         if (!_disposed && IsSessionConnected && _resolution.IsFitToTab)

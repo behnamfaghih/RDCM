@@ -10,9 +10,13 @@
     <ApplicationManifest>app.manifest</ApplicationManifest>
     <ApplicationHighDpiMode>PerMonitorV2</ApplicationHighDpiMode>
     <ApplicationIcon>Assets\RDCM.ico</ApplicationIcon>
-    <Version>1.0.0</Version>
     <AssemblyTitle>RDCM</AssemblyTitle>
-    <Product>Remote Connection Manager</Product>
+    <!--
+      Restore always includes the installer's runtime (win-x64), so building the installer (which publishes for win-x64)
+      leaves the same restore output as a normal build instead of changing it under the IDE and other builds.
+      This affects restore only; normal builds stay runtime-independent.
+    -->
+    <RuntimeIdentifiers>win-x64</RuntimeIdentifiers>
   </PropertyGroup>
 
   <ItemGroup>

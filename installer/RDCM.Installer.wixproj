@@ -1,0 +1,95 @@
+<Project Sdk="WixToolset.Sdk/7.0.1">
+  <!--
+    Builds the per-user RDCM MSI from a framework-dependent win-x64 publish of RDCM.csproj:
+
+      dotnet build installer\RDCM.Installer.wixproj -c Release
+
+    Output: installer\bin\x64\Release\RDCM-<version>-win-x64.msi
+    Version and product identity come from ..\Directory.Build.props.
+  -->
+  <PropertyGroup>
+    <OutputType>Package</OutputType>
+    <InstallerPlatform>x64</InstallerPlatform>
+    <Platform>x64</Platform>
+    <!-- The WiX Toolset v7 EULA (Open Source Maintenance Fee terms); accepted for this project by its owner. -->
+    <AcceptEula>wix7</AcceptEula>
+    <OutputName>RDCM-$(Version)-win-x64</OutputName>
+    <RdcmPublishDir>$(MSBuildProjectDirectory)\obj\publish\$(Configuration)\</RdcmPublishDir>
+    <DefineConstants>ProductVersion=$(Version);ProductName=$(Product);Manufacturer=$(Company);PublishDir=$(RdcmPublishDir);AssetsDir=$(MSBuildProjectDirectory)\..\Assets</DefineConstants>
+    <!-- Pin exact package versions and their hashes for reproducible, auditable restores. -->
+    <RestorePackagesWithLockFile>true</RestorePackagesWithLockFile>
+    <!--
+      Expected validation warnings for this design:
+      ICE61 - AllowSameVersionUpgrades lets a rebuilt package of the same version replace the installed one instead of
+              adding a second Add/Remove Programs entry.
+      ICE91 - The package is per-user only by design, so files are never meant to be copied per user for a per-machine install.
+    -->
+    <SuppressIces>ICE61;ICE91</SuppressIces>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="WixToolset.Util.wixext" Version="7.0.1" />
+    <PackageReference Include="WixToolset.Netfx.wixext" Version="7.0.1" />
+  </ItemGroup>
+
+  <!-- Exactly these files ship. Anything else in the publish output fails the build until it is reviewed. -->
+  <ItemGroup>
+    <RdcmShippedFile Include="RDCM.exe;RDCM.dll;RDCM.runtimeconfig.json;RDCM.deps.json" />
+  </ItemGroup>
+
+  <Target Name="PublishRdcm" BeforeTargets="BeforeBuild">
+    <RemoveDir Directories="$(RdcmPublishDir)" />
+    <MSBuild Projects="..\RDCM.csproj" Targets="Restore" Properties="RuntimeIdentifier=win-x64" />
+    <!--
+      Always built from clean: an incremental WPF build can produce a different (though equivalent) assembly than a clean
+      one, depending on which XAML files changed, and a release must not depend on what was built before.
+    -->
+    <MSBuild Projects="..\RDCM.csproj" Targets="Clean;Publish"
+             Properties="Configuration=$(Configuration);RuntimeIdentifier=win-x64;SelfContained=false;ContinuousIntegrationBuild=true;PublishDir=$(RdcmPublishDir)" />
+    <ItemGroup>
+      <_PublishedFile Include="$(RdcmPublishDir)**\*" Exclude="$(RdcmPublishDir)**\*.pdb" />
+      <_PublishedName Include="@(_PublishedFile->'%(RecursiveDir)%(Filename)%(Extension)')" />
+      <_UnexpectedFile Include="@(_PublishedName)" Exclude="@(RdcmShippedFile)" />
+      <_MissingFile Include="@(RdcmShippedFile)" Exclude="@(_PublishedName)" />
+    </ItemGroup>
+    <Error Condition="'@(_UnexpectedFile)' != ''" Text="Unreviewed file(s) in the RDCM publish output: @(_UnexpectedFile). Add them to RdcmShippedFile and Package.wxs, or remove them." />
+    <Error Condition="'@(_MissingFile)' != ''" Text="Expected file(s) missing from the RDCM publish output: @(_MissingFile)." />
+    <!--
+      Published files keep their build timestamps, which can be older than the last package (for example after a signed
+      build). Marking them as new makes every build package exactly what was just published.
+    -->
+    <Touch Files="@(_PublishedFile)" />
+  </Target>
+
+  <!--
+    Code signing (optional; off unless a certificate is given, and no key or secret is kept in this repository):
+
+      dotnet build installer\RDCM.Installer.wixproj -c Release -p:SigningCertificateThumbprint=<SHA-1 thumbprint>
+          -p:TimestampUrl=<RFC 3161 timestamp server URL> [-p:SignToolPath=<path to signtool.exe>]
+
+    The certificate is used from the current user's certificate store (a hardware token's certificate appears there
+    through its provider). RDCM.exe and RDCM.dll are signed before they are packaged, then the MSI itself is signed;
+    each signature is SHA-256 and timestamped, and is verified with "signtool verify /pa" (a test certificate that this
+    PC doesn't trust fails that check; pass -p:SkipSignatureVerification=true only for such tests).
+  -->
+  <PropertyGroup Condition="'$(SigningCertificateThumbprint)' != ''">
+    <SignOutput>true</SignOutput>
+    <!-- The cabinet is embedded in the MSI, so the MSI signature covers it. -->
+    <SignOutputCabs>false</SignOutputCabs>
+    <SignToolPath Condition="'$(SignToolPath)' == ''">signtool.exe</SignToolPath>
+    <_RdcmSign>"$(SignToolPath)" sign /sha1 $(SigningCertificateThumbprint) /fd sha256 /tr "$(TimestampUrl)" /td sha256</_RdcmSign>
+    <_RdcmVerify>"$(SignToolPath)" verify /pa</_RdcmVerify>
+  </PropertyGroup>
+
+  <Target Name="SignRdcmBinaries" AfterTargets="PublishRdcm" Condition="'$(SigningCertificateThumbprint)' != ''">
+    <Error Condition="'$(TimestampUrl)' == ''" Text="Signing needs -p:TimestampUrl=&lt;RFC 3161 timestamp server URL&gt;, so the signatures stay valid after the certificate expires." />
+    <Exec Command="$(_RdcmSign) &quot;$(RdcmPublishDir)RDCM.exe&quot; &quot;$(RdcmPublishDir)RDCM.dll&quot;" />
+    <Exec Condition="'$(SkipSignatureVerification)' != 'true'" Command="$(_RdcmVerify) &quot;$(RdcmPublishDir)RDCM.exe&quot; &quot;$(RdcmPublishDir)RDCM.dll&quot;" />
+  </Target>
+
+  <!-- WiX Toolset signing hook: signs the built MSI. -->
+  <Target Name="SignMsi" Condition="'$(SigningCertificateThumbprint)' != ''">
+    <Exec Command="$(_RdcmSign) /d &quot;$(Product)&quot; &quot;%(SignMsi.FullPath)&quot;" />
+    <Exec Condition="'$(SkipSignatureVerification)' != 'true'" Command="$(_RdcmVerify) &quot;%(SignMsi.FullPath)&quot;" />
+  </Target>
+</Project>
