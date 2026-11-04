@@ -54,6 +54,16 @@ public partial class SessionView : System.Windows.Controls.UserControl
         var showSession = snapshot.State is RdpSessionState.Connected or RdpSessionState.AutoReconnecting;
         if (_host is not null)
         {
+            if (!showSession && SessionHasKeyboardFocus(_host))
+            {
+                // Keys must not keep going to a hidden (or released, or replaced) remote desktop window. If the window
+                // isn't active WPF can't take Win32 focus now; the button then becomes the element focused on activation.
+                if (!AppControlsButton.Focus())
+                {
+                    System.Windows.Input.FocusManager.SetFocusedElement(
+                        System.Windows.Input.FocusManager.GetFocusScope(AppControlsButton), AppControlsButton);
+                }
+            }
             _host.Visibility = showSession ? Visibility.Visible : Visibility.Hidden;
         }
         StatePanel.Visibility = showSession ? Visibility.Collapsed : Visibility.Visible;
@@ -127,17 +137,34 @@ public partial class SessionView : System.Windows.Controls.UserControl
         StateHint.Visibility = hint is null ? Visibility.Collapsed : Visibility.Visible;
         PanelPrimaryButton.Content = primaryLabel;
         PanelPrimaryButton.Visibility = canRetry ? Visibility.Visible : Visibility.Collapsed;
-        // While Remote Desktop finishes its own reconnect attempts, closing the tab is the way to end them at once.
-        var canClose = canRetry || snapshot.AutoReconnectEnding;
-        PanelCloseButton.Visibility = canClose ? Visibility.Visible : Visibility.Collapsed;
+        PanelCloseButton.Visibility = canRetry ? Visibility.Visible : Visibility.Collapsed;
         PanelCancelButton.Visibility = canCancel ? Visibility.Visible : Visibility.Collapsed;
-        StateActions.Visibility = canRetry || canCancel || canClose ? Visibility.Visible : Visibility.Collapsed;
+        StateActions.Visibility = canRetry || canCancel ? Visibility.Visible : Visibility.Collapsed;
         PanelCopyButton.Visibility = failed ? Visibility.Visible : Visibility.Collapsed;
         ResetCopyButton();
     }
 
     /// <summary>Raised with a short message for the application status bar.</summary>
     public event Action<string>? StatusMessage;
+
+    /// <summary>WPF focus or Win32 focus (the remote desktop's own input window) is inside the session host.</summary>
+    private static bool SessionHasKeyboardFocus(WindowsFormsHost host)
+    {
+        if (host.IsKeyboardFocusWithin)
+        {
+            return true;
+        }
+        var root = host.Handle;
+        var focus = GetFocus();
+        return root != IntPtr.Zero && focus != IntPtr.Zero && (focus == root || IsChild(root, focus));
+    }
+
+    [System.Runtime.InteropServices.DllImport("user32.dll")]
+    private static extern IntPtr GetFocus();
+
+    [System.Runtime.InteropServices.DllImport("user32.dll")]
+    [return: System.Runtime.InteropServices.MarshalAs(System.Runtime.InteropServices.UnmanagedType.Bool)]
+    private static extern bool IsChild(IntPtr parent, IntPtr window);
 
     // Never hidden while it applies: Remote Desktop won't warn if the server isn't the intended computer.
     private void ApplyServerAuthentication(ServerAuthenticationStatus? status)

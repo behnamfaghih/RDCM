@@ -715,7 +715,7 @@ public partial class MainWindow : Window, INotifyPropertyChanged
     {
         var menu = new System.Windows.Controls.ContextMenu();
         var focus = CreateMenuItem("Focus remote desktop", $"Focus {tab.Identity.Name} remote desktop",
-            "\uE7F4", null, (_, _) => tab.Session.Focus());
+            "\uE7F4", null, (_, _) => tab.Session.FocusRemoteDesktop());
         var reconnect = CreateMenuItem("Reconnect", $"Reconnect {tab.Identity.Name} session",
             "\uE72C", null, (_, _) => tab.Session.ReconnectSession());
         var disconnect = CreateMenuItem("Disconnect", $"Disconnect {tab.Identity.Name} session",

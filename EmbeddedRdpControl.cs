@@ -5,19 +5,21 @@ using Microsoft.CSharp.RuntimeBinder;
 namespace RDCM;
 
 /// <summary>
-/// Hosts the Remote Desktop ActiveX control. Connection lifecycle decisions live in
-/// <see cref="RdpConnectionController"/>; this class adapts the native control and owns display settings.
+/// One session tab's Remote Desktop host: a stable container (the child of the tab's WindowsFormsHost) that owns the
+/// logical session and display preferences, and holds one native ActiveX control generation at a time. Connection
+/// lifecycle decisions live in <see cref="RdpConnectionController"/>, which can ask for the native control to be
+/// replaced (the only way to end its own reconnection at once); this class performs the replacement on the UI thread.
 /// </summary>
-public sealed class EmbeddedRdpControl : AxHost
+public sealed class EmbeddedRdpControl : Panel
 {
     private const string RdpClientClassId = "{8B918B82-7985-4C24-89DF-C33AD2BBFBCD}";
     private const int TransitionPollInterval = 250;
     private const int SteadyPollInterval = 1000;
 
     private readonly RdpConnectionController _controller;
+    private readonly RdpControlSlot<NativeRdpControl> _slot;
     private readonly System.Windows.Forms.Timer _pollTimer;
     private readonly System.Windows.Forms.Timer _resizeTimer;
-    private ConnectionPointCookie? _eventCookie;
     private RemoteResolution _resolution = RemoteDisplayOptions.Resolutions[0];
     private RemoteScale _scale = RemoteDisplayOptions.Scales[0];
     private RemoteResolution _activeResolution = RemoteDisplayOptions.Resolutions[0];
@@ -25,9 +27,10 @@ public sealed class EmbeddedRdpControl : AxHost
     private RdpSessionState _lastPublishedState = RdpSessionState.Created;
     private System.Drawing.Size? _layoutSize;
     private (int Width, int Height) _requestedDesktopSize;
-    private bool _startScheduled;
     private bool _hasReportedDisplayError;
     private bool _displaySettingsChanged;
+    private bool _pendingWorkScheduled;
+    private int _lastStaleGenerationLogged;
     private bool _disposed;
 
     /// <summary>Raised (in order) whenever the session state or status text changes.</summary>
@@ -44,12 +47,16 @@ public sealed class EmbeddedRdpControl : AxHost
     public RemoteResolution ActiveResolution => _activeResolution;
     public RemoteScale ActiveScale => _activeScale;
 
+    /// <summary>The current native control generation (0 when there is none). Diagnostics only.</summary>
+    public int ControlGeneration => _slot.Current?.Generation ?? 0;
+
     private bool IsSessionConnected => _controller.State == RdpSessionState.Connected;
 
-    public EmbeddedRdpControl(SessionIdentity identity) : base(RdpClientClassId)
+    public EmbeddedRdpControl(SessionIdentity identity)
     {
         _controller = new RdpConnectionController(identity, new NativeClient(this), log: AppLog.Warning);
         _controller.Changed += OnControllerChanged;
+        _slot = new RdpControlSlot<NativeRdpControl>(generation => new NativeRdpControl(this, generation), LogControl);
         Dock = DockStyle.Fill;
         BackColor = System.Drawing.Color.FromArgb(20, 21, 23);
         _pollTimer = new System.Windows.Forms.Timer { Interval = TransitionPollInterval };
@@ -63,6 +70,8 @@ public sealed class EmbeddedRdpControl : AxHost
                 ApplyDisplaySettings();
             }
         };
+        // The first generation's ActiveX control is created with its window (see EnsureHandle).
+        _slot.TryCreate();
     }
 
     /// <summary>
@@ -90,6 +99,7 @@ public sealed class EmbeddedRdpControl : AxHost
         if (!_disposed && _controller.Disconnect())
         {
             UpdatePolling();
+            SchedulePendingWork();
         }
     }
 
@@ -99,9 +109,17 @@ public sealed class EmbeddedRdpControl : AxHost
     /// </summary>
     public void EnsureHandle()
     {
-        if (!_disposed && !IsDisposed && !IsHandleCreated)
+        if (_disposed || IsDisposed)
+        {
+            return;
+        }
+        if (!IsHandleCreated)
         {
             _ = Handle;
+        }
+        if (_slot.Current is { IsHandleCreated: false } native)
+        {
+            _ = native.Handle;
         }
     }
 
@@ -112,44 +130,23 @@ public sealed class EmbeddedRdpControl : AxHost
         if (!_disposed && _controller.Reconnect(identity))
         {
             UpdatePolling();
+            SchedulePendingWork();
         }
     }
 
-    protected override void CreateSink()
-    {
-        try
-        {
-            var ocx = GetOcx() ?? throw new InvalidOperationException("The Remote Desktop control was not created.");
-            _eventCookie = new ConnectionPointCookie(ocx, new RdpClientEventSink(DispatchNativeEvent, ContinueAutoReconnect), typeof(IMsTscAxEvents));
-            _controller.NativeEventsAvailable = true;
-        }
-        catch (Exception exception) when (exception is not OutOfMemoryException)
-        {
-            AppLog.Warning("Remote Desktop events are unavailable; falling back to state polling.", exception);
-            _controller.NativeEventsAvailable = false;
-        }
-    }
+    /// <summary>Moves keyboard focus into the remote desktop.</summary>
+    public bool FocusRemoteDesktop() => !_disposed && _slot.Current is { } native && native.Focus();
 
-    protected override void DetachSink()
+    /// <summary>Called when a generation's window exists; it starts once the current message has been handled.</summary>
+    private void OnNativeHandleCreated(NativeRdpControl native)
     {
-        _eventCookie?.Disconnect();
-        _eventCookie = null;
-    }
-
-    protected override void OnHandleCreated(EventArgs e)
-    {
-        base.OnHandleCreated(e);
-        if (_startScheduled)
-        {
-            return;
-        }
-        _startScheduled = true;
         BeginInvoke(new Action(() =>
         {
-            if (_disposed)
+            if (_disposed || native.Started || !_slot.IsCurrent(native.Generation))
             {
                 return;
             }
+            native.Started = true;
             _controller.Start();
             UpdatePolling();
         }));
@@ -170,12 +167,24 @@ public sealed class EmbeddedRdpControl : AxHost
         }
     }
 
-    private void DispatchNativeEvent(Action<RdpConnectionController> handler)
+    /// <summary>Delivers a native event to the controller only if it came from the current control generation.</summary>
+    private void DispatchNativeEvent(int generation, Action<RdpConnectionController> handler)
     {
         if (_disposed)
         {
             return;
         }
+        if (!_slot.Route(generation, () => Deliver(handler)))
+        {
+            LogStaleEvent(generation);
+            return;
+        }
+        UpdatePolling();
+        SchedulePendingWork();
+    }
+
+    private void Deliver(Action<RdpConnectionController> handler)
+    {
         try
         {
             handler(_controller);
@@ -185,18 +194,17 @@ public sealed class EmbeddedRdpControl : AxHost
             // Never let a managed exception escape into the ActiveX control.
             AppLog.Error("Handling a Remote Desktop event failed.", exception);
         }
-        UpdatePolling();
-        if (_controller.HasPendingWork && IsHandleCreated)
-        {
-            BeginInvoke(new Action(Poll));
-        }
     }
 
-    /// <summary>Answers the control's OnAutoReconnecting question synchronously. Fails closed (stop) on any error.</summary>
-    private bool ContinueAutoReconnect(int attempt)
+    /// <summary>
+    /// Answers the control's OnAutoReconnecting question synchronously. A released generation, or any error, is told
+    /// to stop.
+    /// </summary>
+    private bool ContinueAutoReconnect(int generation, int attempt)
     {
-        if (_disposed)
+        if (_disposed || !_slot.IsCurrent(generation))
         {
+            LogStaleEvent(generation);
             return false;
         }
         try
@@ -211,7 +219,41 @@ public sealed class EmbeddedRdpControl : AxHost
         finally
         {
             UpdatePolling();
+            SchedulePendingWork();
         }
+    }
+
+    private void LogStaleEvent(int generation)
+    {
+        if (_lastStaleGenerationLogged == generation)
+        {
+            return;
+        }
+        _lastStaleGenerationLogged = generation;
+        AppLog.Warning($"Session {_controller.Identity.SessionId}: ignored an event from released Remote Desktop control generation {generation}.");
+    }
+
+    private void LogControl(string message, Exception? exception) =>
+        AppLog.Warning($"Session {_controller.Identity.SessionId}: {message}", exception);
+
+    /// <summary>
+    /// Runs a pending replacement or reconnect outside native callbacks. Background priority: the accepted state (for
+    /// example "Disconnecting…") is shown before a control is released.
+    /// </summary>
+    private void SchedulePendingWork()
+    {
+        if (_disposed || _pendingWorkScheduled || !_controller.HasPendingWork)
+        {
+            return;
+        }
+        _pendingWorkScheduled = true;
+        System.Windows.Threading.Dispatcher.CurrentDispatcher.BeginInvoke(
+            System.Windows.Threading.DispatcherPriority.Background,
+            new Action(() =>
+            {
+                _pendingWorkScheduled = false;
+                Poll();
+            }));
     }
 
     private void Poll()
@@ -328,7 +370,7 @@ public sealed class EmbeddedRdpControl : AxHost
     {
         try
         {
-            dynamic client = GetOcx()
+            dynamic client = _slot.Current?.GetOcx()
                 ?? throw new InvalidOperationException("The Remote Desktop control is unavailable.");
             var (width, height) = GetRequestedResolution();
             var area = GetSessionAreaSize();
@@ -419,21 +461,129 @@ public sealed class EmbeddedRdpControl : AxHost
     {
         if (disposing && !_disposed)
         {
+            // Same order as before control replacement existed (live-verified to end auto-reconnect at once): the
+            // controller asks a connected control to disconnect, then events are detached and the control released.
             _controller.Shutdown();
             _disposed = true;
             _pollTimer.Dispose();
             _resizeTimer.Dispose();
             _controller.Changed -= OnControllerChanged;
-            DetachSink();
+            _slot.Release(requestDisconnect: false);
         }
 
         base.Dispose(disposing);
     }
 
+    /// <summary>Releases the current control generation and creates a fresh, disconnected one (UI thread only).</summary>
+    private bool ReplaceNativeControl()
+    {
+        if (_disposed)
+        {
+            return false;
+        }
+        var previous = _slot.Current?.Generation ?? 0;
+        var replaced = _slot.Replace();
+        AppLog.Warning($"Session {_controller.Identity.SessionId}: Remote Desktop control generation {previous} released; " +
+                       (replaced ? $"generation {_slot.Current!.Generation} created." : "no new generation could be created."));
+        return replaced;
+    }
+
+    /// <summary>
+    /// One generation of the Remote Desktop ActiveX control. Its events carry its generation, so once it is released
+    /// nothing it raises reaches the session. It is never reused.
+    /// </summary>
+    private sealed class NativeRdpControl(EmbeddedRdpControl owner, int generation)
+        : AxHost(RdpClientClassId), IRdpControlInstance
+    {
+        private ConnectionPointCookie? _cookie;
+
+        public int Generation { get; } = generation;
+
+        /// <summary>The session may use it: its window exists and its start has been processed.</summary>
+        [System.ComponentModel.Browsable(false)]
+        [System.ComponentModel.DesignerSerializationVisibility(System.ComponentModel.DesignerSerializationVisibility.Hidden)]
+        public bool Started { get; set; }
+
+        public void Initialize()
+        {
+            Dock = DockStyle.Fill;
+            BackColor = owner.BackColor;
+            owner.Controls.Add(this);
+            if (owner.IsHandleCreated)
+            {
+                // A replacement: create the ActiveX control now so the session has a usable control again.
+                _ = Handle;
+                if (GetOcx() is null)
+                {
+                    throw new InvalidOperationException("The Remote Desktop control was not created.");
+                }
+            }
+        }
+
+        public void RequestDisconnectIfActive()
+        {
+            if (!IsHandleCreated || GetOcx() is not { } ocx)
+            {
+                return;
+            }
+            dynamic client = ocx;
+            if ((int)client.Connected != RdpConnectionController.NativeNotConnected)
+            {
+                client.Disconnect();
+            }
+        }
+
+        public void DetachEvents()
+        {
+            _cookie?.Disconnect();
+            _cookie = null;
+        }
+
+        protected override void CreateSink()
+        {
+            try
+            {
+                var ocx = GetOcx() ?? throw new InvalidOperationException("The Remote Desktop control was not created.");
+                var generation = Generation;
+                _cookie = new ConnectionPointCookie(ocx,
+                    new RdpClientEventSink(
+                        handler => owner.DispatchNativeEvent(generation, handler),
+                        attempt => owner.ContinueAutoReconnect(generation, attempt)),
+                    typeof(IMsTscAxEvents));
+                owner._controller.NativeEventsAvailable = true;
+            }
+            catch (Exception exception) when (exception is not OutOfMemoryException)
+            {
+                AppLog.Warning("Remote Desktop events are unavailable; falling back to state polling.", exception);
+                owner._controller.NativeEventsAvailable = false;
+            }
+        }
+
+        protected override void DetachSink() => DetachEvents();
+
+        protected override void OnHandleCreated(EventArgs e)
+        {
+            base.OnHandleCreated(e);
+            owner.OnNativeHandleCreated(this);
+        }
+
+        protected override void Dispose(bool disposing)
+        {
+            if (disposing)
+            {
+                DetachEvents();
+            }
+            base.Dispose(disposing);
+        }
+    }
+
     /// <summary>Adapts the ActiveX automation interface; translates native failures to <see cref="RdpClientException"/>.</summary>
     private sealed class NativeClient(EmbeddedRdpControl owner) : IRdpNativeClient
     {
-        public bool IsReady => !owner._disposed && owner.IsHandleCreated && owner.GetOcx() is not null;
+        public bool IsReady => !owner._disposed && owner._slot.Current is { Started: true, IsHandleCreated: true } native
+                               && native.GetOcx() is not null;
+
+        public bool ReplaceControl() => owner.ReplaceNativeControl();
 
         public int ReadConnectionState() =>
             Invoke(client => (int)client.Connected, "Couldn't read the connection state");
@@ -476,7 +626,7 @@ public sealed class EmbeddedRdpControl : AxHost
         {
             try
             {
-                dynamic client = owner.GetOcx() ?? throw new InvalidOperationException("Control unavailable.");
+                dynamic client = owner._slot.Current?.GetOcx() ?? throw new InvalidOperationException("Control unavailable.");
                 var extended = (int)client.ExtendedDisconnectReason;
                 return new RdpDisconnectInfo(extended, (string)client.GetErrorDescription((uint)reason, extended));
             }
@@ -491,7 +641,7 @@ public sealed class EmbeddedRdpControl : AxHost
         {
             try
             {
-                dynamic client = owner.GetOcx()
+                dynamic client = owner._slot.Current?.GetOcx()
                     ?? throw new InvalidOperationException("The Remote Desktop control is not available.");
                 return action(client);
             }

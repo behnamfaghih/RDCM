@@ -15,8 +15,6 @@ public enum RdpEndReason
 /// <summary>
 /// Immutable view of a session, published in order with an increasing sequence number.
 /// <paramref name="NativeDialogOpen"/> is true while the control waits on its own sign-in dialog.
-/// <paramref name="AutoReconnectEnding"/> is true while a disconnect or reconnect waits for the control's own
-/// reconnect attempts to end (closing the tab ends them at once).
 /// </summary>
 public sealed record RdpSessionSnapshot(
     long Sequence,
@@ -28,8 +26,7 @@ public sealed record RdpSessionSnapshot(
     RdpFailureInfo? Failure = null,
     bool NativeDialogOpen = false,
     ServerAuthenticationStatus? ServerAuthentication = null,
-    AutoReconnectProgress? AutoReconnect = null,
-    bool AutoReconnectEnding = false);
+    AutoReconnectProgress? AutoReconnect = null);
 
 /// <summary>
 /// Native auto-reconnect progress from IMsTscAxEvents::OnAutoReconnecting2. <see cref="Attempt"/> and
@@ -68,6 +65,15 @@ public interface IRdpNativeClient
     ServerAuthenticationStatus BeginConnect(SessionIdentity identity);
     void RequestDisconnect();
     RdpDisconnectInfo DescribeDisconnect(int reason);
+
+    /// <summary>
+    /// Releases the native control and puts a fresh, disconnected one in its place. This is the only way found to end the
+    /// control's own reconnection at once: it ignores <see cref="RequestDisconnect"/> while it reconnects (observed live),
+    /// while releasing it (as closing a tab does) ends it immediately. Nothing from the released control reaches the
+    /// controller afterwards. Never called from inside a native callback, or while the control's sign-in window is open.
+    /// Returns false when no fresh control could be created; the old one is released either way.
+    /// </summary>
+    bool ReplaceControl();
 }
 
 /// <summary>A native control call failed. The message is suitable for users; details are in the inner exception.</summary>
@@ -129,14 +135,16 @@ public sealed class RdpConnectionController
     private long _lastDisconnectRequestAt = long.MinValue / 2;
     private bool _signInPromptShownThisAttempt;
 
-    // While the control auto-reconnects it ignores Disconnect() (observed live), and the documented "stop" answer to its
-    // OnAutoReconnecting event was ignored too. It ends when its attempts run out or it restores the session (which is
-    // then disconnected); disposing it (closing the tab) ends it at once.
-    // _nativeAutoReconnecting: the control is in its reconnect loop (set by its attempt events in any state, cleared
-    // when it reports a disconnect or a restore, or when a safety net stops trusting it).
+    // While the control auto-reconnects it ignores Disconnect() and the documented "stop" answer to OnAutoReconnecting
+    // (observed live); only releasing it ends that at once. _nativeAutoReconnecting: the control is in its reconnect
+    // loop (set by its attempt events in any state, cleared when it reports a disconnect or a restore, or is replaced).
+    // _replacementPending: the user's intent has been accepted and the control will be replaced (see Poll); until then
+    // nothing it raises can change the session.
     private bool _nativeAutoReconnecting;
-    private bool _autoReconnectStopSupported;
-    private bool _disconnectWhenRestored;
+    private bool _replacementPending;
+
+    // The last replacement left the session without a usable control; the next explicit Reconnect tries to create one.
+    private bool _controlLost;
 
     public RdpConnectionController(
         SessionIdentity identity,
@@ -167,23 +175,24 @@ public sealed class RdpConnectionController
     /// </summary>
     public bool NativeDialogOpen { get; private set; }
 
-    public bool NeedsPolling => State is RdpSessionState.Connecting or RdpSessionState.Connected
+    public bool NeedsPolling => _replacementPending
+                                || State is RdpSessionState.Connecting or RdpSessionState.Connected
                                     or RdpSessionState.Disconnecting or RdpSessionState.Reconnecting
                                     or RdpSessionState.AutoReconnecting
                                 || (State is RdpSessionState.Disconnected or RdpSessionState.Failed
                                     && (_lastNativeState != NativeNotConnected || _nativeActive));
 
     /// <summary>
-    /// A reconnect is ready to start, or a session restored after the user ended it must be disconnected; the host
-    /// should call <see cref="Poll"/> soon (outside native callbacks).
+    /// A control replacement or a reconnect is ready to run; the host should call <see cref="Poll"/> soon, outside
+    /// native callbacks (after the UI has shown the accepted state).
     /// </summary>
-    public bool HasPendingWork => (State == RdpSessionState.Reconnecting && !_nativeActive) || _disconnectWhenRestored;
+    public bool HasPendingWork => ReplacementDue || (State == RdpSessionState.Reconnecting && !_nativeActive);
 
-    /// <summary>
-    /// The control is reconnecting and is stopped through its next attempt event (Disconnect() doesn't stop it).
-    /// Its attempt events restart the phase timer, so "silent for the safety-net time" means it stopped reporting.
-    /// </summary>
-    private bool AwaitingAutoReconnectStop => _nativeAutoReconnecting && _autoReconnectStopSupported;
+    /// <summary>Releasing the control while its sign-in window is open blocks inside the control, so that waits.</summary>
+    private bool ReplacementDue => _replacementPending && !NativeDialogOpen;
+
+    /// <summary>Events are not accepted from a control that is being replaced or after the session was disposed.</summary>
+    private bool IgnoringNativeEvents => State == RdpSessionState.Disposed || _replacementPending;
 
     /// <summary>The native control is ready; starts the initial connection unless it was cancelled.</summary>
     public void Start()
@@ -223,6 +232,11 @@ public sealed class RdpConnectionController
     /// <summary>Reconnects, optionally with an updated endpoint. Waits for the current native connection to end first.</summary>
     public bool Reconnect(SessionIdentity? identity = null)
     {
+        if (State != RdpSessionState.Disposed && _controlLost && !_replacementPending && !TryRestoreControl())
+        {
+            Publish();
+            return true;
+        }
         switch (State)
         {
             case RdpSessionState.Disposed:
@@ -237,7 +251,7 @@ public sealed class RdpConnectionController
             case RdpSessionState.Reconnecting:
                 _pendingIdentity = identity ?? _pendingIdentity;
                 break;
-            case RdpSessionState.Disconnected or RdpSessionState.Failed when IsNativeIdle():
+            case RdpSessionState.Disconnected or RdpSessionState.Failed when !_replacementPending && IsNativeIdle():
                 BeginAttempt(identity);
                 break;
             default:
@@ -261,7 +275,24 @@ public sealed class RdpConnectionController
 
     public void Poll()
     {
-        if (State is RdpSessionState.Disposed or RdpSessionState.Created || !_client.IsReady)
+        if (State is RdpSessionState.Disposed or RdpSessionState.Created)
+        {
+            return;
+        }
+        if (ReplacementDue)
+        {
+            ReplaceNativeControl();
+            Publish();
+            return;
+        }
+        if (_replacementPending)
+        {
+            // Waiting for the old control's sign-in window to close before releasing it; nothing it reports (its
+            // Connected property reads 1 throughout its reconnect loop) may change the session meanwhile.
+            Publish();
+            return;
+        }
+        if (!_client.IsReady)
         {
             return;
         }
@@ -287,15 +318,6 @@ public sealed class RdpConnectionController
         }
 
         _lastNativeState = native;
-        if (_disconnectWhenRestored)
-        {
-            // The control restored a session the user had already ended; end it now that we're outside its callback.
-            _disconnectWhenRestored = false;
-            if (native != NativeNotConnected)
-            {
-                RequestNativeDisconnect(now, force: true);
-            }
-        }
         if (native == NativeNotConnected)
         {
             if (_nativeIdleSince < 0)
@@ -359,33 +381,19 @@ public sealed class RdpConnectionController
                     Finish(RdpSessionState.Failed, RdpEndReason.ConnectionLost, "Connection lost",
                         "Remote Desktop stopped reporting progress while reconnecting. Try again to start a new connection.",
                         new RdpFailureInfo(RdpFailureCategory.NetworkInterrupted));
-                    // Whatever the control is doing is no longer trusted to be a reconnect: release it actively. A later
-                    // OnAutoReconnecting is answered "stop", and a late restore is disconnected.
-                    _nativeAutoReconnecting = false;
-                    if (native != NativeNotConnected)
-                    {
-                        RequestNativeDisconnect(now, force: true);
-                    }
+                    // Whatever the control is doing is no longer trusted to be a reconnect: replace it (below).
+                    RequestHardStop("it stopped reporting reconnect progress");
                 }
                 break;
             case RdpSessionState.Disconnecting or RdpSessionState.Reconnecting:
-                if (native == NativeNotConnected && eventGraceOver)
+                if (NeedsHardStop)
+                {
+                    // The control kept reconnecting (or started to) after the session was ended.
+                    RequestHardStop("it is reconnecting a session that was ended");
+                }
+                else if (native == NativeNotConnected && eventGraceOver)
                 {
                     CompleteTeardown();
-                }
-                else if (AwaitingAutoReconnectStop)
-                {
-                    // Calling Disconnect() now is ignored; each attempt of the control is answered with "stop", and
-                    // the control ends with a disconnect (or a restore, which is then disconnected).
-                    if (now - _phaseStartedAt >= AutoReconnectSilenceTimeoutMs)
-                    {
-                        _log($"Session {Identity.SessionId}: Remote Desktop stopped reporting reconnect attempts before it could be stopped.", null);
-                        Finish(RdpSessionState.Failed, RdpEndReason.ControlError,
-                            "Remote Desktop didn't stop reconnecting",
-                            "Close the tab to release the session.");
-                        // No longer trusted to be reconnecting: release it with Disconnect() from now on.
-                        _nativeAutoReconnecting = false;
-                    }
                 }
                 else if (native != NativeNotConnected && now - _phaseStartedAt >= DisconnectTimeoutMs)
                 {
@@ -399,18 +407,14 @@ public sealed class RdpConnectionController
                 }
                 break;
             case RdpSessionState.Disconnected or RdpSessionState.Failed:
-                if (native != NativeNotConnected)
+                if (NeedsHardStop)
                 {
-                    // The native control is still active although the session has ended; release it. While it
-                    // reconnects, its attempts are answered with "stop" instead, unless it has gone silent.
-                    if (AwaitingAutoReconnectStop && now - _phaseStartedAt >= AutoReconnectSilenceTimeoutMs)
-                    {
-                        _nativeAutoReconnecting = false;
-                    }
-                    if (!AwaitingAutoReconnectStop)
-                    {
-                        RequestNativeDisconnect(now);
-                    }
+                    RequestHardStop("it is reconnecting a session that has ended");
+                }
+                else if (native != NativeNotConnected)
+                {
+                    // The native control is still active although the session has ended; release it.
+                    RequestNativeDisconnect(now);
                 }
                 else if (eventGraceOver)
                 {
@@ -418,12 +422,16 @@ public sealed class RdpConnectionController
                 }
                 break;
         }
+        if (ReplacementDue)
+        {
+            ReplaceNativeControl();
+        }
         Publish();
     }
 
     public void OnNativeConnecting()
     {
-        if (State == RdpSessionState.Disposed)
+        if (IgnoringNativeEvents)
         {
             return;
         }
@@ -431,6 +439,8 @@ public sealed class RdpConnectionController
         _nativeActive = true;
     }
 
+    // Tracked even for a control that is being replaced: releasing it while its sign-in window is open blocks inside
+    // the control, so the replacement waits for the window to close.
     public void OnNativeDialogShown()
     {
         if (State == RdpSessionState.Disposed)
@@ -438,6 +448,11 @@ public sealed class RdpConnectionController
             return;
         }
         NativeDialogOpen = true;
+        if (_replacementPending)
+        {
+            Publish();
+            return;
+        }
         _signInPromptShownThisAttempt = true;
         _nativeActive = true;
         Publish();
@@ -457,7 +472,7 @@ public sealed class RdpConnectionController
 
     public void OnNativeConnected()
     {
-        if (State == RdpSessionState.Disposed)
+        if (IgnoringNativeEvents)
         {
             return;
         }
@@ -479,56 +494,55 @@ public sealed class RdpConnectionController
 
     /// <summary>
     /// IMsTscAxEvents::OnAutoReconnecting, raised before each automatic attempt. Returns false to ask the control to
-    /// stop: per the documented contract it then ends the attempt and reports a disconnect. The control may keep
-    /// reconnecting only while the session is still wanted. Live (mstscax 10.0.26100.8875) the answer reached the
-    /// control but it kept reconnecting until its attempts ran out, so RDCM never depends on it: the session stays
-    /// "disconnecting" until the control reports a disconnect, and a restore is disconnected at once.
+    /// stop. The control may keep reconnecting only while the session is still wanted. Live (mstscax 10.0.26100.8875)
+    /// the control ignored the "stop" answer, so RDCM doesn't depend on it: an unwanted reconnection is ended by
+    /// replacing the control.
     /// </summary>
     public bool OnNativeAutoReconnectDecision(int attempt)
     {
-        if (State == RdpSessionState.Disposed)
+        if (IgnoringNativeEvents)
         {
             return false;
         }
-        _autoReconnectStopSupported = true;
         NoteNativeAutoReconnectAttempt();
         if (State is RdpSessionState.Connected or RdpSessionState.AutoReconnecting)
         {
             return true;
         }
-        // The control may not honour it at once (it then keeps reporting attempts, and is asked again each time).
         _log($"Session {Identity.SessionId}: asked Remote Desktop to stop reconnecting at attempt {attempt}.", null);
+        if (!NativeDialogOpen && State != RdpSessionState.Created)
+        {
+            RequestHardStop("it is reconnecting a session that was ended");
+        }
         return false;
     }
 
-    /// <summary>The control is in its reconnect loop. Outside a wanted session, each attempt restarts the safety-net timer.</summary>
     private void NoteNativeAutoReconnectAttempt()
     {
         _nativeActive = true;
         _nativeAutoReconnecting = true;
-        if (State is RdpSessionState.Disconnecting or RdpSessionState.Reconnecting
-            or RdpSessionState.Disconnected or RdpSessionState.Failed)
-        {
-            ResetPhase();
-        }
     }
 
     /// <summary>
     /// The network dropped and the control is restoring the same session (OnAutoReconnecting2). Raised for each
-    /// attempt. Shown as progress only while the session is wanted; otherwise the control is being stopped.
+    /// attempt. Shown as progress only while the session is wanted; otherwise the control is replaced.
     /// </summary>
     public void OnNativeAutoReconnecting(int reason, bool networkAvailable, int attempt, int maxAttempts)
     {
+        if (IgnoringNativeEvents)
+        {
+            return;
+        }
         if (State is not (RdpSessionState.Connected or RdpSessionState.AutoReconnecting))
         {
-            if (State is RdpSessionState.Disconnecting or RdpSessionState.Reconnecting
+            // Includes Connecting: a reconnect loop still running from an earlier session would ignore the new attempt.
+            if (State is RdpSessionState.Connecting or RdpSessionState.Disconnecting or RdpSessionState.Reconnecting
                 or RdpSessionState.Disconnected or RdpSessionState.Failed)
             {
                 NoteNativeAutoReconnectAttempt();
-                if (State is RdpSessionState.Disconnected or RdpSessionState.Failed && !_autoReconnectStopSupported)
+                if (!NativeDialogOpen)
                 {
-                    // Without the stop answer (control versions that don't raise OnAutoReconnecting) this is all there is.
-                    RequestNativeDisconnect(_clock(), force: true);
+                    RequestHardStop("it is reconnecting a session that was ended");
                 }
             }
             return;
@@ -546,7 +560,7 @@ public sealed class RdpConnectionController
     /// <summary>The control restored the session (OnAutoReconnected).</summary>
     public void OnNativeAutoReconnected()
     {
-        if (State == RdpSessionState.Disposed)
+        if (IgnoringNativeEvents)
         {
             return;
         }
@@ -560,21 +574,26 @@ public sealed class RdpConnectionController
             case RdpSessionState.Disconnecting or RdpSessionState.Reconnecting
                 or RdpSessionState.Disconnected or RdpSessionState.Failed:
                 // An attempt already under way when the session was ended has succeeded; the user's choice wins.
-                // Live, Disconnect() from inside this callback had no effect, so it is requested from Poll.
-                _log($"Session {Identity.SessionId}: Remote Desktop restored a session that was ended; disconnecting it.", null);
+                _log($"Session {Identity.SessionId}: Remote Desktop restored a session that was ended.", null);
                 _nativeActive = true;
-                _disconnectWhenRestored = true;
-                if (State is RdpSessionState.Disconnecting or RdpSessionState.Reconnecting)
-                {
-                    ResetPhase();
-                }
+                RequestHardStop("it restored a session that was ended");
                 break;
         }
     }
 
     public void OnNativeDisconnected(int reason)
     {
-        if (State == RdpSessionState.Disposed || _awaitingNativeStart)
+        if (State == RdpSessionState.Disposed)
+        {
+            return;
+        }
+        if (_replacementPending)
+        {
+            // The control being replaced has ended its connection; it can't still own a sign-in window.
+            NativeDialogOpen = false;
+            return;
+        }
+        if (_awaitingNativeStart)
         {
             // While waiting for OnConnecting, a disconnect event belongs to the previous native connection.
             return;
@@ -582,7 +601,6 @@ public sealed class RdpConnectionController
 
         _nativeActive = false;
         _nativeAutoReconnecting = false;
-        _disconnectWhenRestored = false;
         // The attempt that owned the sign-in dialog has ended. Live, the dialog-closed event always came first; this
         // also recovers if it is ever lost, so a tab can't be left waiting forever.
         NativeDialogOpen = false;
@@ -618,7 +636,7 @@ public sealed class RdpConnectionController
 
     public void OnNativeFatalError(int errorCode)
     {
-        if (State is RdpSessionState.Disposed or RdpSessionState.Disconnected or RdpSessionState.Failed)
+        if (IgnoringNativeEvents || State is RdpSessionState.Disconnected or RdpSessionState.Failed)
         {
             return;
         }
@@ -638,6 +656,7 @@ public sealed class RdpConnectionController
             return;
         }
         _pendingIdentity = null;
+        _replacementPending = false;
         try
         {
             if (_client.IsReady && _client.ReadConnectionState() != NativeNotConnected)
@@ -672,7 +691,6 @@ public sealed class RdpConnectionController
         _autoReconnect = null;
         _signInPromptShownThisAttempt = false;
         _nativeAutoReconnecting = false;
-        _disconnectWhenRestored = false;
         if (!_client.IsReady)
         {
             _connectDeferred = true;
@@ -721,17 +739,17 @@ public sealed class RdpConnectionController
         }
         SetStatus(RdpEndReason.None,
             !userRequested ? "Reconnecting…" : _connectedThisAttempt ? "Disconnecting…" : "Cancelling connection…",
-            AwaitingAutoReconnectStop
-                ? "Remote Desktop is still trying to restore the connection and ends only after its current attempts, which can take a few minutes. Close the tab to end it now."
-                : null);
+            null);
         ResetPhase();
 
-        if (AwaitingAutoReconnectStop)
+        if (_replacementPending)
         {
-            // Disconnect() is ignored while the control reconnects. Each attempt is answered "stop" (the documented way,
-            // although the control tested live ignored it too); a restore is disconnected at once, and disposing the
-            // control (closing the tab) ends the attempts immediately.
-            _log($"Session {Identity.SessionId}: waiting for Remote Desktop's reconnect attempts to end.", null);
+            // A replacement is already under way; it completes this teardown too.
+            return;
+        }
+        if (NeedsHardStop)
+        {
+            RequestHardStop(userRequested ? "disconnect requested while it was reconnecting" : "reconnect requested while it was reconnecting");
             return;
         }
         // While auto-reconnecting the control is busy even if it reports "not connected", so it must be told to stop.
@@ -764,6 +782,89 @@ public sealed class RdpConnectionController
         Finish(RdpSessionState.Disconnected, reason,
             reason == RdpEndReason.UserDisconnected ? "Disconnected" : "Connection cancelled", null);
     }
+
+    /// <summary>
+    /// The control is doing something the session no longer wants (reconnecting, or a session it restored) and ignores
+    /// Disconnect() while it reconnects. Not while its sign-in window is open: releasing it then blocks inside the control.
+    /// </summary>
+    private bool NeedsHardStop => _nativeAutoReconnecting && !NativeDialogOpen;
+
+    /// <summary>
+    /// Accepts that the current control must be replaced. From now on nothing it raises can change the session; the
+    /// replacement itself runs from <see cref="Poll"/>, outside native callbacks.
+    /// </summary>
+    private void RequestHardStop(string why)
+    {
+        if (_replacementPending)
+        {
+            return;
+        }
+        _replacementPending = true;
+        _log($"Session {Identity.SessionId}: replacing the Remote Desktop control ({why}).", null);
+    }
+
+    private void ReplaceNativeControl()
+    {
+        _replacementPending = false;
+        var replaced = TryReplaceControl();
+        // Whatever the released control was doing went with it.
+        _nativeActive = false;
+        _nativeAutoReconnecting = false;
+        NativeDialogOpen = false;
+        _awaitingNativeStart = false;
+        _lastNativeState = NativeNotConnected;
+        _nativeIdleSince = -1;
+        _controlLost = !replaced;
+        if (!replaced)
+        {
+            FailControlUnavailable();
+            return;
+        }
+        if (State == RdpSessionState.Connecting)
+        {
+            // The connect went to the released control: start the attempt again on the fresh one (deferred until the
+            // host reports it started).
+            BeginAttempt(null);
+            return;
+        }
+        // Disconnecting ends as Disconnected; Reconnecting starts the new attempt on the fresh control (deferred until
+        // the host reports it started). A session that had already ended keeps the result it reported.
+        CompleteTeardown();
+    }
+
+    /// <summary>One attempt to create a control after a replacement left none; used for an explicit Reconnect.</summary>
+    private bool TryRestoreControl()
+    {
+        _controlLost = !TryReplaceControl();
+        if (_controlLost)
+        {
+            FailControlUnavailable();
+        }
+        return !_controlLost;
+    }
+
+    private bool TryReplaceControl()
+    {
+        try
+        {
+            if (_client.ReplaceControl())
+            {
+                _log($"Session {Identity.SessionId}: Remote Desktop control replaced.", null);
+                return true;
+            }
+            _log($"Session {Identity.SessionId}: no Remote Desktop control could be created after the replacement.", null);
+        }
+        catch (Exception exception) when (exception is not OutOfMemoryException)
+        {
+            _log($"Session {Identity.SessionId}: replacing the Remote Desktop control failed.", exception);
+        }
+        return false;
+    }
+
+    private void FailControlUnavailable() =>
+        Finish(RdpSessionState.Failed, RdpEndReason.ControlError, "Remote Desktop couldn't be restarted in this tab",
+            "The previous connection was ended. Close the tab, then connect again.",
+            new RdpFailureInfo(RdpFailureCategory.ClientError));
 
     private void MarkConnected()
     {
@@ -888,7 +989,7 @@ public sealed class RdpConnectionController
         if (current.State == State && current.EndReason == _endReason && current.Message == _message &&
             current.Detail == _detail && current.Identity == Identity && current.Failure == _failure &&
             current.NativeDialogOpen == NativeDialogOpen && current.ServerAuthentication == _serverAuthentication &&
-            current.AutoReconnect == PublishedAutoReconnect && current.AutoReconnectEnding == PublishedAutoReconnectEnding)
+            current.AutoReconnect == PublishedAutoReconnect)
         {
             return;
         }
@@ -899,10 +1000,7 @@ public sealed class RdpConnectionController
     private AutoReconnectProgress? PublishedAutoReconnect =>
         State == RdpSessionState.AutoReconnecting ? _autoReconnect : null;
 
-    private bool PublishedAutoReconnectEnding =>
-        State is RdpSessionState.Disconnecting or RdpSessionState.Reconnecting && AwaitingAutoReconnectStop;
-
     private RdpSessionSnapshot CreateSnapshot(long sequence) =>
         new(sequence, State, _endReason, _message, _detail, Identity, _failure, NativeDialogOpen, _serverAuthentication,
-            PublishedAutoReconnect, PublishedAutoReconnectEnding);
+            PublishedAutoReconnect);
 }

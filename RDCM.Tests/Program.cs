@@ -826,132 +826,6 @@ void RunLifecycleTests()
                controller.Snapshot.Detail!.Contains("tried to reconnect 5 times"));
     });
 
-    Run("auto-reconnect: without the stop answer (controls that don't ask), Disconnect is requested instead", () =>
-    {
-        var (controller, client, _) = Connected();
-        client.State = RdpConnectionController.NativeNotConnected;
-        controller.OnNativeAutoReconnecting(2308, true, 1, 5);
-        Assert(controller.Disconnect());
-        Assert(controller.State == RdpSessionState.Disconnecting && client.DisconnectCalls == 1);
-        controller.OnNativeAutoReconnecting(2308, true, 2, 5);
-        Assert(controller.State == RdpSessionState.Disconnecting);
-        controller.OnNativeDisconnected(1);
-        Assert(controller.Snapshot is { State: RdpSessionState.Disconnected, EndReason: RdpEndReason.UserDisconnected });
-        // A late restore is ended from Poll, outside the native callback.
-        client.State = RdpConnectionController.NativeConnected;
-        controller.OnNativeAutoReconnected();
-        Assert(controller.State == RdpSessionState.Disconnected && client.DisconnectCalls == 1 && controller.HasPendingWork);
-        controller.Poll();
-        Assert(client.DisconnectCalls == 2 && !controller.HasPendingWork);
-    });
-
-    // Observed live (guided run 1): Disconnect() during auto-reconnect was ignored; ~30 s later the control restored the
-    // session behind a "Remote Desktop problem" panel, and later Disconnect() calls had no effect either.
-    Run("auto-reconnect (observed live): Disconnect stops the control at its next attempt, without calling Disconnect()", () =>
-    {
-        var (controller, client, clock) = Connected();
-        // Live, the Connected property stays 1 while the control reconnects.
-        Assert(controller.OnNativeAutoReconnectDecision(1));
-        controller.OnNativeAutoReconnecting(2308, true, 1, 5);
-        Assert(controller.State == RdpSessionState.AutoReconnecting);
-        Assert(controller.Disconnect());
-        Assert(controller.State == RdpSessionState.Disconnecting && client.DisconnectCalls == 0);
-        Assert(controller.Snapshot.Detail!.Contains("Close the tab to end it now") && controller.Snapshot.AutoReconnectEnding);
-        // Live, the next attempt came ~26 s later, past the normal disconnect timeout, which must not fire meanwhile.
-        for (var i = 0; i < 15; i++)
-        {
-            clock.Advance(2_000);
-            controller.Poll();
-        }
-        Assert(controller.State == RdpSessionState.Disconnecting && client.DisconnectCalls == 0);
-        Assert(!controller.OnNativeAutoReconnectDecision(2));
-        controller.OnNativeAutoReconnecting(516, true, 2, 5);
-        clock.Advance(1_000);
-        controller.Poll();
-        Assert(controller.State == RdpSessionState.Disconnecting && client.DisconnectCalls == 0);
-        client.State = RdpConnectionController.NativeNotConnected;
-        controller.OnNativeDisconnected(516);
-        Assert(controller.Snapshot is { State: RdpSessionState.Disconnected, EndReason: RdpEndReason.UserDisconnected, Failure: null });
-        Assert(client.DisconnectCalls == 0 && client.ConnectCalls == 1 && !controller.Snapshot.AutoReconnectEnding);
-    });
-
-    Run("auto-reconnect (observed live): a session restored after the user disconnected is ended again from Poll", () =>
-    {
-        var (controller, client, _) = Connected();
-        Assert(controller.OnNativeAutoReconnectDecision(1));
-        controller.OnNativeAutoReconnecting(2308, true, 1, 5);
-        controller.Disconnect();
-        // The attempt already under way succeeds once the network is back.
-        controller.OnNativeAutoReconnected();
-        Assert(controller.State == RdpSessionState.Disconnecting && client.DisconnectCalls == 0 && controller.HasPendingWork);
-        controller.Poll();
-        Assert(client.DisconnectCalls == 1 && !controller.HasPendingWork);
-        client.State = RdpConnectionController.NativeNotConnected;
-        controller.OnNativeDisconnected(1);
-        Assert(controller.Snapshot is { State: RdpSessionState.Disconnected, EndReason: RdpEndReason.UserDisconnected });
-    });
-
-    Run("auto-reconnect: Reconnect while reconnecting stops the control first, then starts a fresh attempt", () =>
-    {
-        var (controller, client, _) = Connected();
-        Assert(controller.OnNativeAutoReconnectDecision(1));
-        controller.OnNativeAutoReconnecting(2308, true, 1, 5);
-        Assert(controller.Reconnect());
-        Assert(controller.State == RdpSessionState.Reconnecting && client.DisconnectCalls == 0 && client.ConnectCalls == 1);
-        Assert(!controller.OnNativeAutoReconnectDecision(2));
-        client.State = RdpConnectionController.NativeNotConnected;
-        controller.OnNativeDisconnected(516);
-        Assert(controller.HasPendingWork);
-        controller.Poll();
-        Assert(controller.State == RdpSessionState.Connecting && client.ConnectCalls == 2 && client.DisconnectCalls == 0);
-    });
-
-    Run("auto-reconnect: the user's choice holds if the control never reaches another attempt or keeps asking", () =>
-    {
-        var (controller, client, clock) = Connected();
-        Assert(controller.OnNativeAutoReconnectDecision(1));
-        controller.OnNativeAutoReconnecting(2308, true, 1, 5);
-        controller.Disconnect();
-        clock.Advance(RdpConnectionController.AutoReconnectSilenceTimeoutMs);
-        controller.Poll();
-        Assert(controller.Snapshot is { State: RdpSessionState.Failed, EndReason: RdpEndReason.ControlError } && client.DisconnectCalls == 0);
-        Assert(!controller.OnNativeAutoReconnectDecision(2) && !controller.OnNativeAutoReconnectDecision(3));
-        // While it keeps reporting attempts it is only answered "stop"; once silent for the safety-net time, it is
-        // released with Disconnect() instead.
-        controller.Poll();
-        Assert(client.DisconnectCalls == 0);
-        clock.Advance(RdpConnectionController.AutoReconnectSilenceTimeoutMs);
-        controller.Poll();
-        Assert(client.DisconnectCalls == 1);
-        controller.Shutdown();
-        Assert(!controller.OnNativeAutoReconnectDecision(4));
-    });
-
-    // Observed live (guided run 2, before the binding fix): the stop answer was lost and the control kept reconnecting
-    // at ~26 s intervals, then restored the session once the network returned; the restore was disconnected at once.
-    Run("auto-reconnect (observed live): a stop the control doesn't honour at once doesn't become an error", () =>
-    {
-        var (controller, client, clock) = Connected();
-        Assert(controller.OnNativeAutoReconnectDecision(1));
-        controller.OnNativeAutoReconnecting(2308, true, 1, 5);
-        controller.Disconnect();
-        for (var attempt = 2; attempt <= 4; attempt++)
-        {
-            clock.Advance(26_000);
-            controller.Poll();
-            controller.OnNativeAutoReconnecting(516, true, attempt, 5);
-            Assert(!controller.OnNativeAutoReconnectDecision(attempt));
-            controller.Poll();
-            Assert(controller.State == RdpSessionState.Disconnecting && client.DisconnectCalls == 0);
-        }
-        controller.OnNativeAutoReconnected();
-        controller.Poll();
-        Assert(client.DisconnectCalls == 1);
-        client.State = RdpConnectionController.NativeNotConnected;
-        controller.OnNativeDisconnected(1);
-        Assert(controller.Snapshot is { State: RdpSessionState.Disconnected, EndReason: RdpEndReason.UserDisconnected, Failure: null });
-    });
-
     Run("auto-reconnect: the event sink writes 'stop' to both possible positions of the control's answer", () =>
     {
         var keep = true;
@@ -967,30 +841,7 @@ void RunLifecycleTests()
         Assert(asked.SequenceEqual([1, 2]));
     });
 
-    Run("auto-reconnect: a silent control is resolved by the safety net, not left reconnecting forever", () =>
-    {
-        var (controller, client, clock) = Connected();
-        client.State = RdpConnectionController.NativeNotConnected;
-        controller.OnNativeAutoReconnecting(2308, false, 1, 5);
-        clock.Advance(RdpConnectionController.AutoReconnectSilenceTimeoutMs - 1);
-        controller.Poll();
-        Assert(controller.State == RdpSessionState.AutoReconnecting);
-        clock.Advance(1);
-        controller.Poll();
-        Assert(controller.Snapshot is { State: RdpSessionState.Failed, EndReason: RdpEndReason.ConnectionLost });
-
-        // Live, the Connected property reads 1 throughout auto-reconnect, so it isn't evidence of a restored session:
-        // fail closed and release the control.
-        (controller, client, clock) = Connected();
-        Assert(controller.OnNativeAutoReconnectDecision(1));
-        controller.OnNativeAutoReconnecting(2308, true, 1, 5);
-        clock.Advance(RdpConnectionController.AutoReconnectSilenceTimeoutMs);
-        controller.Poll();
-        Assert(controller.Snapshot is { State: RdpSessionState.Failed, EndReason: RdpEndReason.ConnectionLost } && client.DisconnectCalls == 1);
-        Assert(!controller.OnNativeAutoReconnectDecision(2));
-    });
-
-    Run("auto-reconnect: events outside a connected session are ignored; odd progress values aren't shown", () =>
+    Run("auto-reconnect: events outside a connected session aren't shown as progress; odd progress values aren't shown", () =>
     {
         var (controller, client, _) = Lifecycle();
         controller.Start();
@@ -1007,7 +858,379 @@ void RunLifecycleTests()
         Assert(SessionIndicator.For(RdpSessionState.AutoReconnecting) == SessionIndicator.Busy);
     });
 
-    Run("session view: while auto-reconnect ends, the panel explains the wait and offers Close tab", () =>
+    Run("auto-reconnect: a silent control is resolved by the safety net and replaced, not left reconnecting", () =>
+    {
+        var (controller, client, clock) = Connected();
+        client.State = RdpConnectionController.NativeNotConnected;
+        controller.OnNativeAutoReconnecting(2308, false, 1, 5);
+        clock.Advance(RdpConnectionController.AutoReconnectSilenceTimeoutMs - 1);
+        controller.Poll();
+        Assert(controller.State == RdpSessionState.AutoReconnecting && client.ReplaceCalls == 0);
+        clock.Advance(1);
+        controller.Poll();
+        Assert(controller.Snapshot is { State: RdpSessionState.Failed, EndReason: RdpEndReason.ConnectionLost });
+        Assert(client.ReplaceCalls == 1 && client.DisconnectCalls == 0);
+
+        // Live, the Connected property reads 1 throughout auto-reconnect, so it isn't evidence of a restored session.
+        (controller, client, clock) = Connected();
+        controller.OnNativeAutoReconnecting(2308, true, 1, 5);
+        clock.Advance(RdpConnectionController.AutoReconnectSilenceTimeoutMs);
+        controller.Poll();
+        Assert(controller.Snapshot is { State: RdpSessionState.Failed, EndReason: RdpEndReason.ConnectionLost } && client.ReplaceCalls == 1);
+    });
+
+    // Hard disconnect. The installed control ignores Disconnect() and the "stop" answer while it auto-reconnects
+    // (observed live), and releasing it (as closing a tab does) ends that at once. These checks run the controller
+    // with the real RdpControlSlot and fake control generations, routed as EmbeddedRdpControl routes native events.
+    Run("hard disconnect: Disconnect during auto-reconnect replaces the control promptly and ends Disconnected", () =>
+    {
+        var host = ConnectedHost();
+        var first = host.Current;
+        var identity = host.Controller.Identity;
+        BeginAutoReconnect(host);
+        host.Journal.Clear();
+        var published = host.Published.Count;
+        Assert(host.Controller.Disconnect());
+        // Accepted at once; the release runs as separate work, after the UI has shown "Disconnecting…".
+        Assert(host.Controller.Snapshot is { State: RdpSessionState.Disconnecting, Message: "Disconnecting…", Detail: null });
+        Assert(host.Created.Count == 1 && !first.Disposed && host.Controller.HasPendingWork && first.DisconnectRequests == 0);
+        host.RunPendingWork();
+        Assert(host.Controller.Snapshot is { State: RdpSessionState.Disconnected, EndReason: RdpEndReason.UserDisconnected, Failure: null });
+        // Released in the live-verified order, exactly once, and replaced by exactly one fresh, unconnected control.
+        Assert(host.Journal.SequenceEqual(["disconnect-request 1", "detach 1", "dispose 1", "create 2", "initialize 2"]));
+        Assert(first.DisposeCalls == 1 && first.DetachCalls == 1 && !first.EventsAttached);
+        Assert(host.Created.Count == 2 && host.Current.Generation == 2 && host.Current.EventsAttached && host.Current.ConnectCalls == 0);
+        Assert(host.Controller.Identity == identity && !host.Controller.HasPendingWork && !host.Controller.HasActiveSession);
+        // Never reported as connected on the way (so no Recent entry), and nothing reconnects without the user.
+        Assert(host.Published.Skip(published).Select(snapshot => snapshot.State)
+            .SequenceEqual([RdpSessionState.Disconnecting, RdpSessionState.Disconnected]));
+        host.StartCurrent();
+        host.RunPendingWork();
+        host.Controller.Poll();
+        Assert(host.Current.ConnectCalls == 0 && host.Created.Count == 2 && host.Controller.State == RdpSessionState.Disconnected);
+    });
+
+    Run("hard disconnect: nothing from the released control can change the session, before or after the replacement", () =>
+    {
+        var host = ConnectedHost();
+        var first = host.Current;
+        BeginAutoReconnect(host);
+        host.Controller.Disconnect();
+        // Accepted but not yet replaced: the old control is still current, yet nothing it raises is accepted. In
+        // particular the session must not say Disconnected before the old control is actually released.
+        host.Raise(first, controller => controller.OnNativeAutoReconnected());
+        host.Raise(first, controller => controller.OnNativeConnected());
+        host.Raise(first, controller => controller.OnNativeAutoReconnecting(516, true, 2, 5));
+        host.Raise(first, controller => controller.OnNativeDisconnected(516));
+        Assert(!host.AskContinue(first, 2) && host.Controller.State == RdpSessionState.Disconnecting);
+        Assert(!first.Disposed && first.DisconnectRequests == 0 && host.Controller.HasPendingWork);
+        host.RunPendingWork();
+        var published = host.Published.Count;
+        var stale = host.Slot.StaleCallbacks;
+        Assert(!host.Raise(first, controller => controller.OnNativeAutoReconnected()));
+        Assert(!host.Raise(first, controller => controller.OnNativeConnected()));
+        Assert(!host.Raise(first, controller => controller.OnNativeConnecting()));
+        Assert(!host.Raise(first, controller => controller.OnNativeDisconnected(516)));
+        Assert(!host.Raise(first, controller => controller.OnNativeDialogShown()));
+        Assert(!host.Raise(first, controller => controller.OnNativeDialogClosed()));
+        Assert(!host.Raise(first, controller => controller.OnNativeFatalError(4)));
+        Assert(!host.Raise(first, controller => controller.OnNativeAutoReconnecting(516, true, 3, 5)));
+        Assert(!host.AskContinue(first, 3));
+        Assert(host.Slot.StaleCallbacks == stale + 8 && host.Published.Count == published);
+        // A watchdog poll after the replacement looks only at the fresh control.
+        first.State = RdpConnectionController.NativeConnected;
+        host.StartCurrent();
+        host.Controller.Poll();
+        Assert(host.Controller.Snapshot is { State: RdpSessionState.Disconnected, EndReason: RdpEndReason.UserDisconnected, NativeDialogOpen: false });
+        Assert(host.Current.DisconnectRequests == 0 && host.Created.Count == 2);
+    });
+
+    Run("hard disconnect: a later Reconnect uses only the fresh control and re-evaluates its server authentication", () =>
+    {
+        var host = ConnectedHost();
+        var first = host.Current;
+        var weakened = ServerAuthentication.Evaluate(ServerAuthenticationMode.WarnIfUnverified, 0, 0);
+        var verified = ServerAuthentication.Evaluate(ServerAuthenticationMode.WarnIfUnverified, 2, null);
+        host.AuthenticationFor = generation => generation == 1 ? weakened : verified;
+        BeginAutoReconnect(host);
+        host.Controller.Disconnect();
+        host.RunPendingWork();
+        host.StartCurrent();
+        var second = host.Current;
+        Assert(host.Controller.Reconnect());
+        Assert(host.Controller.State == RdpSessionState.Connecting && second.ConnectCalls == 1 && first.ConnectCalls == 1);
+        Assert(host.Controller.Snapshot.ServerAuthentication == verified && !verified.IsWeakened);
+        host.Raise(second, controller => controller.OnNativeConnecting());
+        second.State = RdpConnectionController.NativeConnected;
+        host.Raise(second, controller => controller.OnNativeConnected());
+        Assert(host.Controller.State == RdpSessionState.Connected);
+        // A late failure report from the released control can't fail the new connection.
+        Assert(!host.Raise(first, controller => controller.OnNativeDisconnected(516)) && host.Controller.State == RdpSessionState.Connected);
+    });
+
+    Run("hard disconnect: Reconnect during auto-reconnect replaces the control, then connects once the fresh one starts", () =>
+    {
+        var host = ConnectedHost();
+        var first = host.Current;
+        BeginAutoReconnect(host);
+        Assert(host.Controller.Reconnect());
+        Assert(host.Controller.State == RdpSessionState.Reconnecting && first.ConnectCalls == 1 && first.DisconnectRequests == 0);
+        host.RunPendingWork();
+        var second = host.Current;
+        // The fresh control isn't connected from inside the replacement; it is once the host reports it started.
+        Assert(first.Disposed && host.Controller.State == RdpSessionState.Connecting && second.ConnectCalls == 0);
+        host.StartCurrent();
+        Assert(second.ConnectCalls == 1 && first.ConnectCalls == 1 && host.Created.Count == 2);
+    });
+
+    Run("hard disconnect: repeated Disconnect, Close tab, and application exit during the replacement are safe", () =>
+    {
+        var host = ConnectedHost();
+        var first = host.Current;
+        BeginAutoReconnect(host);
+        Assert(host.Controller.Disconnect());
+        Assert(!host.Controller.Disconnect());
+        host.RunPendingWork();
+        host.RunPendingWork();
+        Assert(host.Created.Count == 2 && first.DisposeCalls == 1 && host.Controller.State == RdpSessionState.Disconnected);
+
+        // Closing the tab (or exiting, which closes every tab) before the pending replacement runs: the old control is
+        // released once by the close itself and no fresh one is created afterwards.
+        FakeSessionHost[] tabs = [ConnectedHost(), ConnectedHost()];
+        BeginAutoReconnect(tabs[0]);
+        var doomed = tabs[0].Current;
+        tabs[0].Controller.Disconnect();
+        foreach (var tab in tabs)
+        {
+            tab.CloseTab();
+            tab.RunPendingWork();
+            tab.Controller.Poll();
+            Assert(tab.Controller.State == RdpSessionState.Disposed && tab.Created.Count == 1 && tab.Slot.Current is null);
+            Assert(tab.Created[0].DisposeCalls == 1 && tab.Created[0].DetachCalls == 1 && !tab.Controller.HasPendingWork);
+        }
+        Assert(!tabs[0].Raise(doomed, controller => controller.OnNativeAutoReconnected()) && !tabs[0].AskContinue(doomed, 2));
+    });
+
+    Run("hard disconnect: if no fresh control can be created, the session fails truthfully and Try again is bounded", () =>
+    {
+        var host = ConnectedHost();
+        var first = host.Current;
+        BeginAutoReconnect(host);
+        host.FailCreateFor = 2;
+        host.Controller.Disconnect();
+        host.RunPendingWork();
+        Assert(host.Controller.Snapshot is { State: RdpSessionState.Failed, EndReason: RdpEndReason.ControlError } &&
+               host.Controller.Snapshot.Message.Contains("couldn't be restarted"));
+        Assert(first.DisposeCalls == 1 && host.Slot.Current is null && !host.Controller.HasActiveSession && !host.Controller.HasPendingWork);
+        Assert(!host.Raise(first, controller => controller.OnNativeAutoReconnected()) && host.Controller.State == RdpSessionState.Failed);
+        host.Controller.Poll();
+        Assert(host.Journal.Count(entry => entry.StartsWith("create")) == 2);
+        // Try again makes one creation attempt per request.
+        host.FailCreateFor = 3;
+        Assert(host.Controller.Reconnect());
+        Assert(host.Controller.State == RdpSessionState.Failed && host.Journal.Count(entry => entry.StartsWith("create")) == 3);
+        host.Controller.Poll();
+        Assert(host.Journal.Count(entry => entry.StartsWith("create")) == 3);
+        Assert(host.Controller.Reconnect());
+        var fresh = host.Current;
+        Assert(fresh.Generation == 4 && host.Controller.State == RdpSessionState.Connecting && fresh.ConnectCalls == 0);
+        host.StartCurrent();
+        Assert(fresh.ConnectCalls == 1);
+    });
+
+    Run("hard disconnect: a fresh control that fails to start is released and doesn't revive the old session", () =>
+    {
+        var host = ConnectedHost();
+        var first = host.Current;
+        BeginAutoReconnect(host);
+        host.FailInitializeFor = 2;
+        host.Controller.Disconnect();
+        host.RunPendingWork();
+        var failed = host.Created[1];
+        Assert(failed.DetachCalls == 1 && failed.DisposeCalls == 1 && !failed.EventsAttached && host.Slot.Current is null);
+        Assert(first.Disposed && host.Controller.Snapshot is { State: RdpSessionState.Failed, EndReason: RdpEndReason.ControlError });
+        Assert(!host.Raise(first, controller => controller.OnNativeAutoReconnected()));
+        Assert(!host.Raise(failed, controller => controller.OnNativeConnected()));
+        Assert(host.Controller.State == RdpSessionState.Failed && !host.Controller.HasActiveSession);
+    });
+
+    Run("hard disconnect: releasing keeps going when a step fails, and the failed control is never used again", () =>
+    {
+        var host = ConnectedHost();
+        var first = host.Current;
+        BeginAutoReconnect(host);
+        first.ThrowOnRelease = true;
+        host.Journal.Clear();
+        host.Controller.Disconnect();
+        host.RunPendingWork();
+        Assert(host.Journal.SequenceEqual(["disconnect-request 1", "detach 1", "dispose 1", "create 2", "initialize 2"]));
+        Assert(host.Controller.Snapshot is { State: RdpSessionState.Disconnected, EndReason: RdpEndReason.UserDisconnected });
+        Assert(host.Current.Generation == 2 && !host.Raise(first, controller => controller.OnNativeConnected()));
+    });
+
+    Run("hard disconnect: a normal Disconnect of a connected session doesn't replace the control", () =>
+    {
+        var host = ConnectedHost();
+        var first = host.Current;
+        host.Controller.Disconnect();
+        Assert(host.Controller.State == RdpSessionState.Disconnecting && first.DisconnectRequests == 1 && !host.Controller.HasPendingWork);
+        first.State = RdpConnectionController.NativeNotConnected;
+        host.Raise(first, controller => controller.OnNativeDisconnected(1));
+        host.Controller.Poll();
+        Assert(host.Controller.Snapshot is { State: RdpSessionState.Disconnected, EndReason: RdpEndReason.UserDisconnected });
+        Assert(host.Created.Count == 1 && !first.Disposed);
+    });
+
+    Run("hard disconnect: never while the Windows Security window is open; it waits for the window, then replaces", () =>
+    {
+        // Cancelling the initial sign-in keeps its behaviour: no replacement at all.
+        var host = new FakeSessionHost(SessionIdentity.Capture(Profile("Sign-in")));
+        host.StartCurrent();
+        var first = host.Current;
+        host.Raise(first, controller => controller.OnNativeConnecting());
+        host.Raise(first, controller => controller.OnNativeDialogShown());
+        host.Controller.Disconnect();
+        host.RunPendingWork();
+        host.Controller.Poll();
+        Assert(host.Controller.State == RdpSessionState.Disconnecting && first.DisconnectRequests == 1 && host.Created.Count == 1);
+        host.Raise(first, controller => controller.OnNativeDialogClosed());
+        first.State = RdpConnectionController.NativeNotConnected;
+        host.Raise(first, controller => controller.OnNativeDisconnected(7943));
+        Assert(host.Controller.Snapshot is { State: RdpSessionState.Disconnected, EndReason: RdpEndReason.ConnectionCancelled });
+        Assert(host.Created.Count == 1 && !first.Disposed);
+
+        // The control asks for sign-in while reconnecting: Disconnect waits for that window, then replaces the control.
+        host = ConnectedHost();
+        first = host.Current;
+        BeginAutoReconnect(host);
+        host.Raise(first, controller => controller.OnNativeDialogShown());
+        host.Controller.Disconnect();
+        host.RunPendingWork();
+        host.Controller.Poll();
+        Assert(host.Created.Count == 1 && !first.Disposed && host.Controller.Snapshot is { State: RdpSessionState.Disconnecting, NativeDialogOpen: true });
+        host.Raise(first, controller => controller.OnNativeDialogClosed());
+        host.Controller.Poll();
+        Assert(first.DisposeCalls == 1 && host.Created.Count == 2);
+        Assert(host.Controller.Snapshot is { State: RdpSessionState.Disconnected, EndReason: RdpEndReason.UserDisconnected, NativeDialogOpen: false });
+
+        // A sign-in window that opens after the replacement was accepted also holds it until the window closes.
+        host = ConnectedHost();
+        first = host.Current;
+        BeginAutoReconnect(host);
+        host.Controller.Disconnect();
+        host.Raise(first, controller => controller.OnNativeDialogShown());
+        Assert(!host.Controller.HasPendingWork && host.Controller.NativeDialogOpen);
+        host.Controller.Poll();
+        Assert(!first.Disposed);
+        host.Raise(first, controller => controller.OnNativeDialogClosed());
+        Assert(host.Controller.HasPendingWork);
+        host.RunPendingWork();
+        Assert(first.Disposed && host.Controller.State == RdpSessionState.Disconnected);
+    });
+
+    Run("hard disconnect: a control reconnecting or restoring a session that had already ended is replaced", () =>
+    {
+        // Disconnect was requested while connected, and the network dropped before the control finished.
+        var host = ConnectedHost();
+        var first = host.Current;
+        host.Controller.Disconnect();
+        host.Raise(first, controller => controller.OnNativeAutoReconnecting(2308, true, 1, 5));
+        Assert(host.Controller.HasPendingWork && host.Controller.State == RdpSessionState.Disconnecting);
+        host.RunPendingWork();
+        Assert(first.Disposed && host.Controller.Snapshot is { State: RdpSessionState.Disconnected, EndReason: RdpEndReason.UserDisconnected });
+
+        // A restore without attempt events before it (other control versions), after the session had ended.
+        host = ConnectedHost();
+        first = host.Current;
+        host.Controller.Disconnect();
+        first.State = RdpConnectionController.NativeNotConnected;
+        host.Raise(first, controller => controller.OnNativeDisconnected(1));
+        first.State = RdpConnectionController.NativeConnected;
+        host.Raise(first, controller => controller.OnNativeAutoReconnected());
+        Assert(host.Controller.HasPendingWork && host.Controller.State == RdpSessionState.Disconnected);
+        host.RunPendingWork();
+        Assert(first.Disposed && host.Created.Count == 2 && host.Controller.Snapshot is { State: RdpSessionState.Disconnected, EndReason: RdpEndReason.UserDisconnected });
+    });
+
+    Run("hard disconnect: a reconnect loop found while connecting is replaced, and the attempt restarts on the fresh control", () =>
+    {
+        // Review finding: the connect had gone to the released control and the fresh one was never asked to connect.
+        foreach (var progressFirst in new[] { false, true })
+        {
+            var host = new FakeSessionHost(SessionIdentity.Capture(Profile("Connecting")));
+            host.StartCurrent();
+            var first = host.Current;
+            host.Raise(first, controller => controller.OnNativeConnecting());
+            Assert(host.Controller.State == RdpSessionState.Connecting && first.ConnectCalls == 1);
+            if (progressFirst)
+            {
+                host.Raise(first, controller => controller.OnNativeAutoReconnecting(2308, true, 2, 5));
+            }
+            Assert(!host.AskContinue(first, 2) && host.Controller.HasPendingWork);
+            host.RunPendingWork();
+            var second = host.Current;
+            Assert(first.Disposed && second.Generation == 2 && host.Controller.State == RdpSessionState.Connecting && second.ConnectCalls == 0);
+            host.StartCurrent();
+            Assert(second.ConnectCalls == 1 && first.ConnectCalls == 1);
+            host.Raise(second, controller => controller.OnNativeConnecting());
+            second.State = RdpConnectionController.NativeConnected;
+            host.Raise(second, controller => controller.OnNativeConnected());
+            Assert(host.Controller.State == RdpSessionState.Connected);
+        }
+
+        // Before any attempt there is nothing to replace: the control is only told to stop.
+        var idle = new FakeSessionHost(SessionIdentity.Capture(Profile("Created")));
+        Assert(!idle.AskContinue(idle.Current, 1) && !idle.Controller.HasPendingWork && idle.Controller.State == RdpSessionState.Created);
+        idle.StartCurrent();
+        Assert(idle.Controller.State == RdpSessionState.Connecting && idle.Current.ConnectCalls == 1 && idle.Created.Count == 1);
+
+        // Review finding: while the replacement waits for the old control's sign-in window, its Connected property (1
+        // throughout its reconnect loop) must not mark the new attempt connected.
+        var waiting = new FakeSessionHost(SessionIdentity.Capture(Profile("Waiting")));
+        waiting.StartCurrent();
+        var old = waiting.Current;
+        waiting.Raise(old, controller => controller.OnNativeConnecting());
+        waiting.Raise(old, controller => controller.OnNativeAutoReconnecting(2308, true, 2, 5));
+        waiting.Raise(old, controller => controller.OnNativeDialogShown());
+        old.State = RdpConnectionController.NativeConnected;
+        var published = waiting.Published.Count;
+        waiting.Controller.Poll();
+        waiting.Clock.Advance(RdpConnectionController.StartTimeoutMs * 2);
+        waiting.Controller.Poll();
+        Assert(waiting.Controller.State == RdpSessionState.Connecting && !old.Disposed);
+        Assert(waiting.Published.Skip(published).All(snapshot => snapshot.State == RdpSessionState.Connecting));
+        waiting.Raise(old, controller => controller.OnNativeDialogClosed());
+        waiting.RunPendingWork();
+        waiting.StartCurrent();
+        Assert(old.Disposed && waiting.Current.Generation == 2 && waiting.Current.ConnectCalls == 1 && waiting.Controller.State == RdpSessionState.Connecting);
+    });
+
+    Run("hard disconnect: 100 replace-and-reconnect cycles leave one live control and no stale subscriptions", () =>
+    {
+        var host = ConnectedHost();
+        for (var cycle = 1; cycle <= 100; cycle++)
+        {
+            var previous = host.Current;
+            BeginAutoReconnect(host);
+            host.Controller.Disconnect();
+            host.RunPendingWork();
+            host.StartCurrent();
+            Assert(host.Controller.State == RdpSessionState.Disconnected);
+            host.Controller.Reconnect();
+            var fresh = host.Current;
+            host.Raise(fresh, controller => controller.OnNativeConnecting());
+            fresh.State = RdpConnectionController.NativeConnected;
+            host.Raise(fresh, controller => controller.OnNativeConnected());
+            Assert(host.Controller.State == RdpSessionState.Connected && fresh.Generation == cycle + 1);
+            Assert(!host.Raise(previous, controller => controller.OnNativeDisconnected(516)));
+        }
+        Assert(host.Created.Count == 101 && host.Slot.StaleCallbacks == 100);
+        Assert(host.Created.Take(100).All(control => control.DisposeCalls == 1 && control.DetachCalls == 1 && !control.EventsAttached));
+        Assert(host.Created.Count(control => control.EventsAttached) == 1 && !host.Created[100].Disposed);
+        Assert(host.Created.All(control => control.ConnectCalls == 1));
+    });
+
+    Run("session view: Disconnecting hides the remote surface and shows no failure; the host releases its control", () =>
     {
         Exception? failure = null;
         var thread = new Thread(() =>
@@ -1022,19 +1245,26 @@ void RunLifecycleTests()
                         Source = new Uri("pack://application:,,,/RDCM;component/Themes/Controls.xaml")
                     });
                 }
+                var identity = SessionIdentity.Capture(Profile("View"));
+                var session = new EmbeddedRdpControl(identity);
+                var host = new System.Windows.Forms.Integration.WindowsFormsHost { Child = session };
                 var view = new SessionView();
+                view.AttachSession(session, host);
                 var element = (string name) => (System.Windows.FrameworkElement)view.FindName(name);
-                var ending = new RdpSessionSnapshot(1, RdpSessionState.Disconnecting, RdpEndReason.None, "Disconnecting…",
-                    "Remote Desktop is still trying to restore the connection… Close the tab to end it now.",
-                    SessionIdentity.Capture(Profile("View")), AutoReconnectEnding: true);
-                view.Apply(ending);
-                Assert(element("PanelCloseButton").Visibility == System.Windows.Visibility.Visible &&
-                       element("StateActions").Visibility == System.Windows.Visibility.Visible);
-                Assert(((System.Windows.Controls.TextBlock)element("StateHint")).Text.Contains("Close the tab"));
-                view.Apply(ending with { Sequence = 2, Detail = null, AutoReconnectEnding = false });
-                Assert(element("PanelCloseButton").Visibility == System.Windows.Visibility.Collapsed &&
-                       element("StateActions").Visibility == System.Windows.Visibility.Collapsed &&
+                // The first control generation exists but isn't created natively until the tab is shown.
+                Assert(session.ControlGeneration == 1);
+                var reconnecting = new RdpSessionSnapshot(1, RdpSessionState.AutoReconnecting, RdpEndReason.None,
+                    "Connection interrupted · reconnecting (attempt 1 of 5)", null, identity);
+                view.Apply(reconnecting);
+                Assert(host.Visibility == System.Windows.Visibility.Visible);
+                view.Apply(reconnecting with { Sequence = 2, State = RdpSessionState.Disconnecting, Message = "Disconnecting…" });
+                Assert(host.Visibility == System.Windows.Visibility.Hidden && element("StatePanel").Visibility == System.Windows.Visibility.Visible);
+                Assert(((System.Windows.Controls.TextBlock)element("StateTitle")).Text == "Disconnecting…" &&
+                       element("PanelCopyButton").Visibility == System.Windows.Visibility.Collapsed &&
                        element("StateHint").Visibility == System.Windows.Visibility.Collapsed);
+                session.Dispose();
+                Assert(session.ControlGeneration == 0 && session.Controls.Count == 0);
+                host.Dispose();
             }
             catch (Exception exception)
             {
@@ -1071,6 +1301,27 @@ void RunLifecycleTests()
     controller.OnNativeConnected();
     Assert(controller.State == RdpSessionState.Connected);
     return (controller, client, clock);
+}
+
+FakeSessionHost ConnectedHost()
+{
+    var host = new FakeSessionHost(SessionIdentity.Capture(Profile("Hard disconnect")));
+    host.StartCurrent();
+    var first = host.Current;
+    Assert(first.ConnectCalls == 1);
+    host.Raise(first, controller => controller.OnNativeConnecting());
+    first.State = RdpConnectionController.NativeConnected;
+    host.Raise(first, controller => controller.OnNativeConnected());
+    Assert(host.Controller.State == RdpSessionState.Connected);
+    return host;
+}
+
+/// <summary>Live order: OnAutoReconnecting2 reports progress; the Connected property stays 1 meanwhile.</summary>
+void BeginAutoReconnect(FakeSessionHost host)
+{
+    var current = host.Current;
+    host.Raise(current, controller => controller.OnNativeAutoReconnecting(2308, true, 1, 5));
+    Assert(host.AskContinue(current, 1) && host.Controller.State == RdpSessionState.AutoReconnecting);
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -1380,6 +1631,179 @@ sealed class FakeRdpClient : IRdpNativeClient
 
     public RdpDisconnectInfo DescribeDisconnect(int reason) =>
         new(ExtendedReason, reason == 260 ? "Remote Desktop can't find the computer \"x\". More text." : null);
+
+    public int ReplaceCalls { get; private set; }
+    public int Generation { get; private set; } = 1;
+    public bool FailReplacement { get; set; }
+
+    public bool ReplaceControl()
+    {
+        ReplaceCalls++;
+        State = RdpConnectionController.NativeNotConnected;
+        if (FailReplacement)
+        {
+            IsReady = false;
+            return false;
+        }
+        Generation++;
+        return true;
+    }
+}
+
+/// <summary>Fake native control generation: records the order of its lifecycle calls in a shared journal.</summary>
+sealed class FakeControlInstance(int generation, List<string> journal) : IRdpControlInstance
+{
+    public int Generation => generation;
+
+    /// <summary>The control's Connected property.</summary>
+    public int State { get; set; }
+    public bool Started { get; set; }
+    public bool Initialized { get; private set; }
+    public bool EventsAttached { get; private set; }
+    public bool Disposed => DisposeCalls > 0;
+    public int ConnectCalls { get; set; }
+    public int DisconnectRequests { get; set; }
+    public int DetachCalls { get; private set; }
+    public int DisposeCalls { get; private set; }
+    public bool FailInitialize { get; init; }
+    public bool ThrowOnRelease { get; set; }
+
+    public void Initialize()
+    {
+        journal.Add($"initialize {generation}");
+        // Events are connected before a later step fails, as a partly started ActiveX control would be.
+        EventsAttached = true;
+        if (FailInitialize)
+        {
+            throw new InvalidOperationException("simulated: the control couldn't be started");
+        }
+        Initialized = true;
+    }
+
+    public void RequestDisconnectIfActive()
+    {
+        journal.Add($"disconnect-request {generation}");
+        ThrowIfRequested();
+    }
+
+    public void DetachEvents()
+    {
+        journal.Add($"detach {generation}");
+        DetachCalls++;
+        EventsAttached = false;
+        ThrowIfRequested();
+    }
+
+    public void Dispose()
+    {
+        journal.Add($"dispose {generation}");
+        DisposeCalls++;
+        State = RdpConnectionController.NativeNotConnected;
+        ThrowIfRequested();
+    }
+
+    private void ThrowIfRequested()
+    {
+        if (ThrowOnRelease)
+        {
+            throw new InvalidOperationException("simulated release failure");
+        }
+    }
+}
+
+/// <summary>
+/// The session host as EmbeddedRdpControl wires it, with fake control generations: native events are routed through the
+/// real <see cref="RdpControlSlot{TInstance}"/> by generation, a replacement runs as separate pending work (as
+/// SchedulePendingWork does), and a fresh control is used only once the host reports it started. Only the ActiveX
+/// specifics (AxHost window, COM connection point) are not modelled; those are covered by the live tests.
+/// </summary>
+sealed class FakeSessionHost : IRdpNativeClient
+{
+    public readonly List<string> Journal = [];
+    public readonly List<FakeControlInstance> Created = [];
+    public readonly RdpControlSlot<FakeControlInstance> Slot;
+    public readonly RdpConnectionController Controller;
+    public readonly ManualClock Clock = new();
+    public readonly List<RdpSessionSnapshot> Published = [];
+    public int? FailCreateFor { get; set; }
+    public int? FailInitializeFor { get; set; }
+    public Func<int, ServerAuthenticationStatus> AuthenticationFor { get; set; } =
+        _ => ServerAuthentication.Evaluate(ServerAuthentication.RequestedMode, (int)ServerAuthentication.RequestedMode, null);
+
+    public FakeSessionHost(SessionIdentity identity)
+    {
+        Slot = new RdpControlSlot<FakeControlInstance>(Create, (_, _) => { });
+        Controller = new RdpConnectionController(identity, this, Clock.Now) { NativeEventsAvailable = true };
+        Controller.Changed += Published.Add;
+        Slot.TryCreate();
+    }
+
+    public FakeControlInstance Current => Slot.Current ?? throw new InvalidOperationException("No current control.");
+
+    private FakeControlInstance Create(int generation)
+    {
+        Journal.Add($"create {generation}");
+        if (FailCreateFor == generation)
+        {
+            throw new InvalidOperationException("simulated: the control can't be created");
+        }
+        var instance = new FakeControlInstance(generation, Journal) { FailInitialize = FailInitializeFor == generation };
+        Created.Add(instance);
+        return instance;
+    }
+
+    /// <summary>EmbeddedRdpControl's posted start once a generation's window exists.</summary>
+    public void StartCurrent()
+    {
+        if (Slot.Current is { Started: false, Initialized: true } current)
+        {
+            current.Started = true;
+            Controller.Start();
+        }
+    }
+
+    /// <summary>EmbeddedRdpControl.SchedulePendingWork: background work, outside native callbacks.</summary>
+    public void RunPendingWork()
+    {
+        if (Controller.HasPendingWork)
+        {
+            Controller.Poll();
+        }
+    }
+
+    /// <summary>A native event from <paramref name="source"/>, routed as EmbeddedRdpControl routes it.</summary>
+    public bool Raise(FakeControlInstance source, Action<RdpConnectionController> handler) =>
+        Slot.Route(source.Generation, () => handler(Controller));
+
+    /// <summary>OnAutoReconnecting from <paramref name="source"/>: a released generation is always told to stop.</summary>
+    public bool AskContinue(FakeControlInstance source, int attempt) =>
+        Slot.IsCurrent(source.Generation) && Controller.OnNativeAutoReconnectDecision(attempt);
+
+    /// <summary>EmbeddedRdpControl.Dispose (close tab, exit).</summary>
+    public void CloseTab()
+    {
+        Controller.Shutdown();
+        Slot.Release(requestDisconnect: false);
+    }
+
+    public bool IsReady => Slot.Current is { Started: true };
+
+    public int ReadConnectionState() =>
+        Slot.Current?.State ?? throw new RdpClientException("The Remote Desktop control is not available.");
+
+    public ServerAuthenticationStatus BeginConnect(SessionIdentity identity)
+    {
+        var current = Current;
+        current.ConnectCalls++;
+        current.State = RdpConnectionController.NativeConnecting;
+        return AuthenticationFor(current.Generation);
+    }
+
+    public void RequestDisconnect() => Current.DisconnectRequests++;
+
+    public RdpDisconnectInfo DescribeDisconnect(int reason) => new(0, null);
+
+    public bool ReplaceControl() => Slot.Replace();
 }
 
 sealed class ManualClock

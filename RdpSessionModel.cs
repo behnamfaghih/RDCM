@@ -25,7 +25,7 @@ public sealed class RdpSessionModel(SessionIdentity identity)
             [RdpSessionState.Connected] = [RdpSessionState.Disconnecting, RdpSessionState.Disconnected, RdpSessionState.Reconnecting, RdpSessionState.Failed, RdpSessionState.AutoReconnecting, RdpSessionState.Disposed],
             [RdpSessionState.AutoReconnecting] = [RdpSessionState.Connected, RdpSessionState.Disconnecting, RdpSessionState.Disconnected, RdpSessionState.Reconnecting, RdpSessionState.Failed, RdpSessionState.Disposed],
             [RdpSessionState.Disconnecting] = [RdpSessionState.Disconnected, RdpSessionState.Reconnecting, RdpSessionState.Failed, RdpSessionState.Disposed],
-            [RdpSessionState.Disconnected] = [RdpSessionState.Connecting, RdpSessionState.Reconnecting, RdpSessionState.Disconnecting, RdpSessionState.Disposed],
+            [RdpSessionState.Disconnected] = [RdpSessionState.Connecting, RdpSessionState.Reconnecting, RdpSessionState.Disconnecting, RdpSessionState.Failed, RdpSessionState.Disposed],
             [RdpSessionState.Reconnecting] = [RdpSessionState.Disconnecting, RdpSessionState.Connecting, RdpSessionState.Failed, RdpSessionState.Disconnected, RdpSessionState.Disposed],
             [RdpSessionState.Failed] = [RdpSessionState.Connecting, RdpSessionState.Disconnecting, RdpSessionState.Reconnecting, RdpSessionState.Disconnected, RdpSessionState.Disposed],
             [RdpSessionState.Disposed] = []
