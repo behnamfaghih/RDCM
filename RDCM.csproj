@@ -9,6 +9,11 @@
     <UseWindowsForms>true</UseWindowsForms>
     <ApplicationManifest>app.manifest</ApplicationManifest>
     <ApplicationHighDpiMode>PerMonitorV2</ApplicationHighDpiMode>
+    <!--
+      WFO0003 recommends Application.SetHighDpiMode for Windows Forms applications. RDCM is a WPF application, which
+      declares DPI awareness in app.manifest (the documented mechanism for WPF); SetHighDpiMode would run too late.
+    -->
+    <NoWarn>$(NoWarn);WFO0003</NoWarn>
     <ApplicationIcon>Assets\RDCM.ico</ApplicationIcon>
     <AssemblyTitle>RDCM</AssemblyTitle>
     <!--

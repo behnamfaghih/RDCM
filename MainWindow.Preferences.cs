@@ -60,7 +60,7 @@ public partial class MainWindow
 
     private void RestoreWindowPlacement()
     {
-        var placement = WindowPlacementSettings.Validate(_settings.MainWindow, WindowPlacementService.GetWorkAreas());
+        var placement = WindowPlacementSettings.Validate(_settings.MainWindow, MonitorLayout.GetMonitors(), MonitorLayout.GetSystemDpi());
         if (placement is null)
         {
             return;

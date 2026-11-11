@@ -276,16 +276,25 @@ public partial class SessionView : System.Windows.Controls.UserControl
     private static string WindowsVersion =>
         $"{System.Runtime.InteropServices.RuntimeInformation.OSDescription} ({System.Runtime.InteropServices.RuntimeInformation.OSArchitecture})";
 
+    /// <summary>
+    /// After a move to a monitor with a different scale, the session area keeps its size in device-independent units, so
+    /// no SizeChanged follows; its physical size and DPI must be measured again here.
+    /// </summary>
+    protected override void OnDpiChanged(DpiScale oldDpi, DpiScale newDpi)
+    {
+        base.OnDpiChanged(oldDpi, newDpi);
+        UpdateSessionAreaSize();
+    }
+
     private void UpdateSessionAreaSize()
     {
         if (_session is null || HostContainer.ActualWidth <= 0 || HostContainer.ActualHeight <= 0)
         {
             return;
         }
-        var dpi = VisualTreeHelper.GetDpi(HostContainer);
-        _session.LayoutSize = new System.Drawing.Size(
-            (int)Math.Round(HostContainer.ActualWidth * dpi.DpiScaleX),
-            (int)Math.Round(HostContainer.ActualHeight * dpi.DpiScaleY));
+        var scale = VisualTreeHelper.GetDpi(HostContainer);
+        var dpi = Dpi.IsPlausible((int)Math.Round(scale.PixelsPerInchX)) ? new Dpi((int)Math.Round(scale.PixelsPerInchX)) : Dpi.Default;
+        _session.SessionArea = new SessionAreaMetrics(dpi.ToPhysical(HostContainer.ActualWidth), dpi.ToPhysical(HostContainer.ActualHeight), dpi);
     }
 
     // Collapses labels to icons so the single-row toolbar fits narrow workspaces.
