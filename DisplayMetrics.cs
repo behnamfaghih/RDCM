@@ -62,17 +62,61 @@ public static class MonitorLayout
         var monitors = new List<MonitorDescription>();
         EnumDisplayMonitors(IntPtr.Zero, IntPtr.Zero, (monitor, _, _, _) =>
         {
-            var info = new MonitorInfo { Size = Marshal.SizeOf<MonitorInfo>() };
-            if (GetMonitorInfo(monitor, ref info))
+            if (Describe(monitor) is { } description)
             {
-                var dpi = GetDpiForMonitor(monitor, MonitorDpiTypeEffective, out var dpiX, out _) == 0 && Dpi.IsPlausible((int)dpiX)
-                    ? new Dpi((int)dpiX)
-                    : GetSystemDpi();
-                monitors.Add(new MonitorDescription(info.Monitor.ToRectangle(), info.Work.ToRectangle(), dpi, (info.Flags & MonitorInfoPrimary) != 0));
+                monitors.Add(description);
             }
             return true;
         }, IntPtr.Zero);
         return monitors;
+    }
+
+    /// <summary>
+    /// The monitor with the mouse pointer (or the nearest one), where Windows opens new windows; the primary monitor when
+    /// the pointer position can't be read (for example while the computer is locked).
+    /// </summary>
+    public static MonitorDescription? GetMonitorAtCursor() =>
+        Describe(GetCursorPos(out var point)
+            ? MonitorFromPoint(point, MonitorDefaultToNearest)
+            : MonitorFromPoint(default, MonitorDefaultToPrimary));
+
+    private static MonitorDescription? Describe(IntPtr monitor)
+    {
+        var info = new MonitorInfo { Size = Marshal.SizeOf<MonitorInfo>() };
+        if (monitor == IntPtr.Zero || !GetMonitorInfo(monitor, ref info))
+        {
+            return null;
+        }
+        var dpi = GetDpiForMonitor(monitor, MonitorDpiTypeEffective, out var dpiX, out _) == 0 && Dpi.IsPlausible((int)dpiX)
+            ? new Dpi((int)dpiX)
+            : GetSystemDpi();
+        return new MonitorDescription(info.Monitor.ToRectangle(), info.Work.ToRectangle(), dpi, (info.Flags & MonitorInfoPrimary) != 0);
+    }
+
+    /// <summary>
+    /// Centres a window without an owner on the monitor with the mouse pointer. WPF's CenterScreen sizes the window at the
+    /// DPI it was created at before moving it, so on a monitor with a different scale it can open too large and partly
+    /// off-screen. The window is moved to the monitor before it is shown (Windows then rescales it for that monitor's
+    /// DPI) and centred again once it has its final size.
+    /// </summary>
+    public static void CenterOnMonitorWithCursor(System.Windows.Window window)
+    {
+        window.WindowStartupLocation = System.Windows.WindowStartupLocation.Manual;
+        void Center()
+        {
+            var handle = new System.Windows.Interop.WindowInteropHelper(window).Handle;
+            if (handle == IntPtr.Zero || GetMonitorAtCursor() is not { } monitor || !GetWindowRect(handle, out var rect))
+            {
+                return;
+            }
+            var area = monitor.WorkArea;
+            var width = Math.Min(rect.Right - rect.Left, area.Width);
+            var height = Math.Min(rect.Bottom - rect.Top, area.Height);
+            SetWindowPos(handle, IntPtr.Zero, area.Left + (area.Width - width) / 2, area.Top + (area.Height - height) / 2, 0, 0,
+                SwpNoSize | SwpNoZOrder | SwpNoActivate);
+        }
+        window.SourceInitialized += (_, _) => Center();
+        window.Loaded += (_, _) => Center();
     }
 
     /// <summary>The system DPI: the primary monitor's DPI when the user signed in (what system-aware programs use).</summary>
@@ -103,7 +147,30 @@ public static class MonitorLayout
 
     private const int MonitorDpiTypeEffective = 0;
     private const uint MonitorInfoPrimary = 1;
+    private const uint MonitorDefaultToPrimary = 1;
     private const uint MonitorDefaultToNearest = 2;
+    private const uint SwpNoSize = 0x0001;
+    private const uint SwpNoZOrder = 0x0004;
+    private const uint SwpNoActivate = 0x0010;
+
+    /// <summary>
+    /// Keeps a window no taller than the work area of the monitor it is on, in the window's own device-independent
+    /// units (SystemParameters.WorkArea describes only the primary monitor). Updated when the window moves to a monitor
+    /// with a different scale.
+    /// </summary>
+    public static void LimitHeightToMonitorWorkArea(System.Windows.Window window)
+    {
+        void Update()
+        {
+            var handle = new System.Windows.Interop.WindowInteropHelper(window).Handle;
+            if (GetWorkAreaForWindow(handle) is { } monitor)
+            {
+                window.MaxHeight = monitor.Dpi.ToLogical(monitor.WorkArea.Height);
+            }
+        }
+        window.SourceInitialized += (_, _) => Update();
+        window.DpiChanged += (_, _) => Update();
+    }
 
     private delegate bool MonitorEnumProc(IntPtr monitor, IntPtr hdc, IntPtr clip, IntPtr data);
 
@@ -135,6 +202,25 @@ public static class MonitorLayout
 
     [DllImport("user32.dll")]
     private static extern IntPtr MonitorFromWindow(IntPtr hwnd, uint flags);
+
+    [DllImport("user32.dll")]
+    private static extern IntPtr MonitorFromPoint(NativePoint point, uint flags);
+
+    [DllImport("user32.dll")]
+    private static extern bool GetCursorPos(out NativePoint point);
+
+    [DllImport("user32.dll")]
+    private static extern bool GetWindowRect(IntPtr hwnd, out NativeRect rect);
+
+    [DllImport("user32.dll")]
+    private static extern bool SetWindowPos(IntPtr hwnd, IntPtr after, int x, int y, int width, int height, uint flags);
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct NativePoint
+    {
+        public int X;
+        public int Y;
+    }
 
     [DllImport("shcore.dll")]
     private static extern int GetDpiForMonitor(IntPtr monitor, int type, out uint dpiX, out uint dpiY);

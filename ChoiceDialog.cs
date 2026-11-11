@@ -158,7 +158,7 @@ public sealed class ChoiceDialog : Window
         }
         else
         {
-            dialog.WindowStartupLocation = WindowStartupLocation.CenterScreen;
+            MonitorLayout.CenterOnMonitorWithCursor(dialog);
         }
         dialog.ShowDialog();
     }

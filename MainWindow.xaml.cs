@@ -428,7 +428,7 @@ public partial class MainWindow : Window, INotifyPropertyChanged
 
         var identity = SessionIdentity.Capture(profile);
         var session = new EmbeddedRdpControl(identity);
-        var windowsFormsHost = new WindowsFormsHost
+        var windowsFormsHost = new SessionHost
         {
             Child = session,
             Focusable = true
@@ -504,9 +504,12 @@ public partial class MainWindow : Window, INotifyPropertyChanged
         scalePicker.SelectionChanged += ScalePicker_SelectionChanged;
         tab.ScalePicker = scalePicker;
 
-        session.DisplayError += message => Dispatcher.BeginInvoke(new Action(() =>
+        session.DisplayError += (message, notify) => Dispatcher.BeginInvoke(new Action(() =>
         {
-            StatusText.Text = $"{tab.Identity.Name}: {message}";
+            if (notify)
+            {
+                StatusText.Text = $"{tab.Identity.Name}: {message}";
+            }
             resolutionPicker.SelectedItem = session.RequestedResolution;
             scalePicker.SelectedItem = session.RequestedScale;
         }));
