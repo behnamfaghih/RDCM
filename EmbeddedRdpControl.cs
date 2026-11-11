@@ -1,4 +1,4 @@
-using System.Runtime.InteropServices;
+﻿using System.Runtime.InteropServices;
 using System.Windows.Forms;
 using Microsoft.CSharp.RuntimeBinder;
 
@@ -18,34 +18,38 @@ public sealed class EmbeddedRdpControl : Panel
 
     private readonly RdpConnectionController _controller;
     private readonly RdpControlSlot<NativeRdpControl> _slot;
+    private readonly RemoteDisplayCoordinator _display;
     private readonly System.Windows.Forms.Timer _pollTimer;
     private readonly System.Windows.Forms.Timer _resizeTimer;
-    private RemoteResolution _resolution = RemoteDisplayOptions.Resolutions[0];
-    private RemoteScale _scale = RemoteDisplayOptions.Scales[0];
-    private RemoteResolution _activeResolution = RemoteDisplayOptions.Resolutions[0];
-    private RemoteScale _activeScale = RemoteDisplayOptions.Scales[0];
     private RdpSessionState _lastPublishedState = RdpSessionState.Created;
-    private System.Drawing.Size? _layoutSize;
-    private (int Width, int Height) _requestedDesktopSize;
-    private bool _hasReportedDisplayError;
-    private bool _displaySettingsChanged;
     private bool _pendingWorkScheduled;
     private int _lastStaleGenerationLogged;
     private bool _disposed;
 
     /// <summary>Raised (in order) whenever the session state or status text changes.</summary>
     public event Action<RdpSessionSnapshot>? SessionChanged;
-    public event Action<string>? DisplayError;
+
+    /// <summary>
+    /// A display change failed and the requested settings went back to the ones the session uses. The flag says whether
+    /// to tell the user: a failure is reported once until a display change succeeds again.
+    /// </summary>
+    public event Action<string, bool>? DisplayError;
 
     public RdpSessionSnapshot Snapshot => _controller.Snapshot;
     public bool HasActiveSession => _controller.HasActiveSession;
 
     /// <summary>True while the control shows its own sign-in dialog. The control must not be disposed until it closes.</summary>
     public bool IsNativeDialogOpen => _controller.NativeDialogOpen;
-    public RemoteResolution RequestedResolution => _resolution;
-    public RemoteScale RequestedScale => _scale;
-    public RemoteResolution ActiveResolution => _activeResolution;
-    public RemoteScale ActiveScale => _activeScale;
+    public RemoteResolution RequestedResolution => _display.Resolution;
+    public RemoteScale RequestedScale => _display.Scale;
+    public RemoteResolution ActiveResolution => _display.ActiveResolution;
+    public RemoteScale ActiveScale => _display.ActiveScale;
+
+    /// <summary>Display updates sent to the connected session. Diagnostics only.</summary>
+    public int DisplayUpdatesSent => _display.UpdatesSent;
+
+    /// <summary>The desktop size the remote session last reported, from the current control. Diagnostics only.</summary>
+    public (int Width, int Height)? RemoteDesktopSize { get; private set; }
 
     /// <summary>The current native control generation (0 when there is none). Diagnostics only.</summary>
     public int ControlGeneration => _slot.Current?.Generation ?? 0;
@@ -57,42 +61,45 @@ public sealed class EmbeddedRdpControl : Panel
         _controller = new RdpConnectionController(identity, new NativeClient(this), log: AppLog.Warning);
         _controller.Changed += OnControllerChanged;
         _slot = new RdpControlSlot<NativeRdpControl>(generation => new NativeRdpControl(this, generation), LogControl);
-        Dock = DockStyle.Fill;
-        BackColor = System.Drawing.Color.FromArgb(20, 21, 23);
         _pollTimer = new System.Windows.Forms.Timer { Interval = TransitionPollInterval };
         _pollTimer.Tick += (_, _) => Poll();
-        _resizeTimer = new System.Windows.Forms.Timer { Interval = 350 };
+        _resizeTimer = new System.Windows.Forms.Timer { Interval = RemoteDisplayCoordinator.SettleDelayMilliseconds };
+        _display = new RemoteDisplayCoordinator(
+            new DisplayClient(this),
+            () => !_disposed && IsSessionConnected,
+            () =>
+            {
+                _resizeTimer.Stop();
+                _resizeTimer.Start();
+            },
+            () => new SessionAreaMetrics(Width, Height, Dpi.IsPlausible(DeviceDpi) ? new Dpi(DeviceDpi) : Dpi.Default));
+        _display.StatusChanged += message => _controller.UpdateConnectedMessage(message);
+        _display.UpdateFailed += ReportDisplayError;
         _resizeTimer.Tick += (_, _) =>
         {
             _resizeTimer.Stop();
-            if (IsSessionConnected && _resolution.IsFitToTab && GetRequestedResolution() != _requestedDesktopSize)
-            {
-                ApplyDisplaySettings();
-            }
+            _display.OnSettleDelayElapsed();
         };
+        Dock = DockStyle.Fill;
+        BackColor = System.Drawing.Color.FromArgb(20, 21, 23);
         // The first generation's ActiveX control is created with its window (see EnsureHandle).
         _slot.TryCreate();
     }
 
     /// <summary>
-    /// Size of the tab's session area in device pixels. Used for fit-to-tab resolution while the
-    /// native surface is hidden (for example during connection setup).
+    /// Physical size and DPI of the tab's session area, measured from WPF layout. Used for the fit-to-tab resolution
+    /// (also while the native surface is hidden, for example during connection setup) and the session's display scale.
     /// </summary>
-    [System.ComponentModel.Browsable(false)]
-    [System.ComponentModel.DesignerSerializationVisibility(System.ComponentModel.DesignerSerializationVisibility.Hidden)]
-    public System.Drawing.Size? LayoutSize
+    public void SetSessionArea(SessionAreaMetrics area)
     {
-        get => _layoutSize;
-        set
+        if (!_disposed)
         {
-            if (_layoutSize == value)
-            {
-                return;
-            }
-            _layoutSize = value;
-            ScheduleFitToTabUpdate();
+            _display.SetSessionArea(area);
         }
     }
+
+    /// <summary>The session area last reported (or the control's own size before layout). Diagnostics only.</summary>
+    public SessionAreaMetrics SessionArea => _display.Area;
 
     public void DisconnectSession()
     {
@@ -155,7 +162,8 @@ public sealed class EmbeddedRdpControl : Panel
     protected override void OnSizeChanged(EventArgs e)
     {
         base.OnSizeChanged(e);
-        ScheduleFitToTabUpdate();
+        // Null only while the base constructor runs.
+        _display?.OnControlResized();
     }
 
     /// <summary>
@@ -184,13 +192,15 @@ public sealed class EmbeddedRdpControl : Panel
     [DllImport("user32.dll")]
     private static extern bool ShowWindow(IntPtr hwnd, int command);
 
-    private void ScheduleFitToTabUpdate()
+    /// <summary>The remote session reported its desktop size (it changed or the session started). Diagnostics only.</summary>
+    private void OnRemoteDesktopSizeChanged(int generation, int width, int height)
     {
-        if (!_disposed && IsSessionConnected && _resolution.IsFitToTab)
+        if (_disposed || !_slot.IsCurrent(generation))
         {
-            _resizeTimer.Stop();
-            _resizeTimer.Start();
+            return;
         }
+        RemoteDesktopSize = (width, height);
+        AppLog.Information($"Session {_controller.Identity.SessionId}: the remote desktop reports {width} × {height}.");
     }
 
     /// <summary>Delivers a native event to the controller only if it came from the current control generation.</summary>
@@ -321,166 +331,20 @@ public sealed class EmbeddedRdpControl : Panel
             return;
         }
 
-        if (_displaySettingsChanged)
-        {
-            ApplyDisplaySettings();
-        }
-        else
-        {
-            _activeResolution = _resolution;
-            _activeScale = _scale;
-            _controller.UpdateConnectedMessage(DescribeConnectedDisplay());
-        }
+        _display.OnConnected();
     }
 
-    public bool SetResolution(RemoteResolution resolution)
-    {
-        if (_resolution == resolution)
-        {
-            return true;
-        }
+    public bool SetResolution(RemoteResolution resolution) => _display.SetResolution(resolution);
 
-        var previous = _resolution;
-        _resolution = resolution;
-        _displaySettingsChanged = true;
-        if (IsSessionConnected && !ApplyDisplaySettings())
-        {
-            _resolution = previous;
-            return false;
-        }
-        return true;
-    }
+    public bool SetScale(RemoteScale scale) => _display.SetScale(scale);
 
-    public bool SetScale(RemoteScale scale)
-    {
-        if (_scale == scale)
-        {
-            return true;
-        }
-
-        var previous = _scale;
-        _scale = scale;
-        _displaySettingsChanged = true;
-        if (IsSessionConnected && !ApplyDisplaySettings())
-        {
-            _scale = previous;
-            return false;
-        }
-        return true;
-    }
-
-    private (int Width, int Height) GetRequestedResolution()
-    {
-        if (!_resolution.IsFitToTab)
-        {
-            return (_resolution.Width, _resolution.Height);
-        }
-
-        static int RoundToSupportedSize(int size, int minimum) =>
-            Math.Clamp(size - size % 4, minimum, 8192);
-
-        var size = GetSessionAreaSize();
-        return (RoundToSupportedSize(size.Width, 640), RoundToSupportedSize(size.Height, 480));
-    }
-
-    private System.Drawing.Size GetSessionAreaSize() =>
-        _layoutSize is { Width: > 0, Height: > 0 } layout ? layout : new System.Drawing.Size(Width, Height);
-
-    private string DescribeConnectedDisplay()
-    {
-        var (width, height) = GetRequestedResolution();
-        return $"Connected · {width} × {height} · {_scale.Percent}%";
-    }
-
-    private bool ApplyDisplaySettings()
-    {
-        try
-        {
-            dynamic client = _slot.Current?.GetOcx()
-                ?? throw new InvalidOperationException("The Remote Desktop control is unavailable.");
-            var (width, height) = GetRequestedResolution();
-            var area = GetSessionAreaSize();
-            var physicalWidth = GetPhysicalSizeMillimeters(area.Width);
-            var physicalHeight = GetPhysicalSizeMillimeters(area.Height);
-
-            client.UpdateSessionDisplaySettings(
-                (uint)width,
-                (uint)height,
-                physicalWidth,
-                physicalHeight,
-                0u,
-                _scale.Percent,
-                GetDeviceScaleFactor());
-            client.AdvancedSettings9.SmartSizing = true;
-            _requestedDesktopSize = (width, height);
-            _displaySettingsChanged = false;
-            _hasReportedDisplayError = false;
-            _activeResolution = _resolution;
-            _activeScale = _scale;
-            _controller.UpdateConnectedMessage(DescribeConnectedDisplay());
-            return true;
-        }
-        catch (COMException exception)
-        {
-            RestoreActiveDisplaySettings();
-            ReportDisplayError(
-                "The remote computer rejected the display change. It may not support dynamic resolution or scaling.",
-                exception);
-        }
-        catch (InvalidComObjectException exception)
-        {
-            RestoreActiveDisplaySettings();
-            ReportDisplayError("The Remote Desktop control stopped responding.", exception);
-        }
-        catch (RuntimeBinderException exception)
-        {
-            RestoreActiveDisplaySettings();
-            ReportDisplayError("This version of Remote Desktop doesn't support changing display settings during a session.", exception);
-        }
-        catch (InvalidOperationException exception)
-        {
-            RestoreActiveDisplaySettings();
-            ReportDisplayError(exception.Message, exception);
-        }
-        return false;
-    }
-
-    private void RestoreActiveDisplaySettings()
-    {
-        _resolution = _activeResolution;
-        _scale = _activeScale;
-        _displaySettingsChanged = false;
-    }
-
-    private uint GetPhysicalSizeMillimeters(int sizeInPixels)
-    {
-        var dpi = DeviceDpi > 0 ? DeviceDpi : 96;
-        var millimeters = (uint)Math.Clamp(
-            Math.Round(sizeInPixels * 25.4 / dpi),
-            10,
-            10_000);
-        return millimeters;
-    }
-
-    private uint GetDeviceScaleFactor()
-    {
-        var scale = DeviceDpi * 100d / 96;
-        return (uint)new[] { 100, 140, 180 }
-            .OrderBy(candidate => Math.Abs(candidate - scale))
-            .First();
-    }
-
-    private void ReportDisplayError(string message, Exception exception)
+    private void ReportDisplayError(string message, Exception exception, bool notifyUser)
     {
         AppLog.Warning($"Display change failed: {message}", exception);
         _controller.UpdateConnectedMessage(message);
-        if (_hasReportedDisplayError)
-        {
-            return;
-        }
-
-        _hasReportedDisplayError = true;
-        DisplayError?.Invoke(message);
+        // Always raised: the settings went back to the last confirmed ones, so the toolbar must show them again even
+        // when the user isn't told again.
+        DisplayError?.Invoke(message, notifyUser);
     }
 
     protected override void Dispose(bool disposing)
@@ -574,7 +438,8 @@ public sealed class EmbeddedRdpControl : Panel
                 _cookie = new ConnectionPointCookie(ocx,
                     new RdpClientEventSink(
                         handler => owner.DispatchNativeEvent(generation, handler),
-                        attempt => owner.ContinueAutoReconnect(generation, attempt)),
+                        attempt => owner.ContinueAutoReconnect(generation, attempt),
+                        (width, height) => owner.OnRemoteDesktopSizeChanged(generation, width, height)),
                     typeof(IMsTscAxEvents));
                 owner._controller.NativeEventsAvailable = true;
             }
@@ -603,6 +468,44 @@ public sealed class EmbeddedRdpControl : Panel
         }
     }
 
+    /// <summary>
+    /// Sends display settings to the current control generation only; a released generation is never updated.
+    /// </summary>
+    private sealed class DisplayClient(EmbeddedRdpControl owner) : IRemoteDisplayClient
+    {
+        public void Apply(RemoteDisplaySettings settings)
+        {
+            try
+            {
+                dynamic client = (owner._disposed ? null : owner._slot.Current?.GetOcx())
+                    ?? throw new RemoteDisplayUpdateException("The Remote Desktop control is unavailable.");
+                client.UpdateSessionDisplaySettings(
+                    (uint)settings.DesktopWidth,
+                    (uint)settings.DesktopHeight,
+                    settings.PhysicalWidthMillimeters,
+                    settings.PhysicalHeightMillimeters,
+                    0u,
+                    settings.DesktopScaleFactor,
+                    settings.DeviceScaleFactor);
+                client.AdvancedSettings9.SmartSizing = true;
+            }
+            catch (COMException exception)
+            {
+                throw new RemoteDisplayUpdateException(
+                    "The remote computer rejected the display change. It may not support dynamic resolution or scaling.", exception);
+            }
+            catch (InvalidComObjectException exception)
+            {
+                throw new RemoteDisplayUpdateException("The Remote Desktop control stopped responding.", exception);
+            }
+            catch (RuntimeBinderException exception)
+            {
+                throw new RemoteDisplayUpdateException(
+                    "This version of Remote Desktop doesn't support changing display settings during a session.", exception);
+            }
+        }
+    }
+
     /// <summary>Adapts the ActiveX automation interface; translates native failures to <see cref="RdpClientException"/>.</summary>
     private sealed class NativeClient(EmbeddedRdpControl owner) : IRdpNativeClient
     {
@@ -618,10 +521,22 @@ public sealed class EmbeddedRdpControl : Panel
         {
             client.Server = identity.Host.Trim().TrimStart('[').TrimEnd(']');
             client.UserName = identity.Username.Trim();
-            var (width, height) = owner.GetRequestedResolution();
-            client.DesktopWidth = width;
-            client.DesktopHeight = height;
-            owner._requestedDesktopSize = (width, height);
+            // From the session area and preferences as they are now: a fresh control after a move uses the current
+            // monitor's pixels and device scale factor, and the remote scaling chosen for this session.
+            var display = owner._display.SettingsForConnect();
+            client.DesktopWidth = display.DesktopWidth;
+            client.DesktopHeight = display.DesktopHeight;
+            try
+            {
+                RdpExtendedSettings.SetScaleFactors((object)client, display.DesktopScaleFactor, display.DeviceScaleFactor);
+            }
+            catch (Exception exception) when (exception is InvalidCastException or COMException or ArgumentException)
+            {
+                AppLog.Warning("The remote scaling couldn't be set before connecting; it is sent once the session is connected.", exception);
+                owner._display.OnConnectScaleUnavailable();
+            }
+            AppLog.Information($"Connecting with a {display.DesktopWidth} × {display.DesktopHeight} remote desktop; " +
+                               $"desktop scale {display.DesktopScaleFactor}%, device scale {display.DeviceScaleFactor}%.");
             client.AdvancedSettings9.RDPPort = identity.Port;
             client.AdvancedSettings9.EnableCredSspSupport = true;
             // The control returns S_FALSE (not an error) when a policy overrides this, so read back what applies.

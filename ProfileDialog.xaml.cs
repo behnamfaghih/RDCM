@@ -27,6 +27,7 @@ public partial class ProfileDialog : Window
     {
         InitializeComponent();
         ThemeManager.TrackWindow(this);
+        MonitorLayout.LimitHeightToMonitorWorkArea(this);
         _existingProfiles = existingProfiles ?? [];
         _fields =
         [

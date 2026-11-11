@@ -60,7 +60,10 @@ public partial class MainWindow
 
     private void RestoreWindowPlacement()
     {
-        var placement = WindowPlacementSettings.Validate(_settings.MainWindow, MonitorLayout.GetMonitors(), MonitorLayout.GetSystemDpi());
+        // Without a usable saved position, RDCM opens centred on the monitor with the mouse pointer (as CenterScreen
+        // intends), sized for that monitor's DPI; WPF's CenterScreen would size it for the primary monitor's DPI.
+        var placement = WindowPlacementSettings.Validate(_settings.MainWindow, MonitorLayout.GetMonitors(), MonitorLayout.GetSystemDpi())
+            ?? (MonitorLayout.GetMonitorAtCursor() is { } monitor ? WindowPlacementSettings.CenteredOn(monitor, Width, Height) : null);
         if (placement is null)
         {
             return;

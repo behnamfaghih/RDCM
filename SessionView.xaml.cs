@@ -278,23 +278,24 @@ public partial class SessionView : System.Windows.Controls.UserControl
 
     /// <summary>
     /// After a move to a monitor with a different scale, the session area keeps its size in device-independent units, so
-    /// no SizeChanged follows; its physical size and DPI must be measured again here.
+    /// no SizeChanged follows; its physical size and DPI must be measured again here. The new DPI comes from the
+    /// arguments: when a hidden tab is shown again, this runs before the session area's own DPI is updated.
     /// </summary>
     protected override void OnDpiChanged(DpiScale oldDpi, DpiScale newDpi)
     {
         base.OnDpiChanged(oldDpi, newDpi);
-        UpdateSessionAreaSize();
+        UpdateSessionAreaSize(newDpi);
     }
 
-    private void UpdateSessionAreaSize()
+    private void UpdateSessionAreaSize(DpiScale? knownDpi = null)
     {
         if (_session is null || HostContainer.ActualWidth <= 0 || HostContainer.ActualHeight <= 0)
         {
             return;
         }
-        var scale = VisualTreeHelper.GetDpi(HostContainer);
+        var scale = knownDpi ?? VisualTreeHelper.GetDpi(HostContainer);
         var dpi = Dpi.IsPlausible((int)Math.Round(scale.PixelsPerInchX)) ? new Dpi((int)Math.Round(scale.PixelsPerInchX)) : Dpi.Default;
-        _session.SessionArea = new SessionAreaMetrics(dpi.ToPhysical(HostContainer.ActualWidth), dpi.ToPhysical(HostContainer.ActualHeight), dpi);
+        _session.SetSessionArea(new SessionAreaMetrics(dpi.ToPhysical(HostContainer.ActualWidth), dpi.ToPhysical(HostContainer.ActualHeight), dpi));
     }
 
     // Collapses labels to icons so the single-row toolbar fits narrow workspaces.
