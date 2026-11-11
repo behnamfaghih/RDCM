@@ -8,6 +8,9 @@ namespace RDCM;
 /// </summary>
 public static class AppLog
 {
+    public static void Information(string message) =>
+        Trace.TraceInformation(Format(message, null));
+
     public static void Warning(string message, Exception? exception = null) =>
         Trace.TraceWarning(Format(message, exception));
 

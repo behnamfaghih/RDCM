@@ -5,7 +5,6 @@
         Title="New connection"
         Width="520"
         SizeToContent="Height"
-        MaxHeight="{Binding Source={x:Static SystemParameters.WorkArea}, Path=Height}"
         ResizeMode="NoResize"
         ShowInTaskbar="False"
         WindowStartupLocation="CenterOwner"

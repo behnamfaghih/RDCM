@@ -16,6 +16,7 @@ public interface IMsTscAxEvents
     [DispId(3)] void OnLoginComplete();
     [DispId(4)] void OnDisconnected(int discReason);
     [DispId(10)] void OnFatalError(int errorCode);
+    [DispId(12)] void OnRemoteDesktopSizeChange(int width, int height);
     // OnAutoReconnecting(disconnectReason, attemptCount, [out] pArcContinueStatus). Observed live (mstscax 10.0.26100):
     // the control passes these arguments in declaration order instead of the reversed order IDispatch uses, so the
     // [out] status binds to the first parameter and the reason to the last. Both ends are bound by reference; see the sink.
@@ -29,10 +30,14 @@ public interface IMsTscAxEvents
 /// <summary>
 /// Forwards native events to the owning control. Exceptions never propagate back into COM.
 /// <paramref name="continueAutoReconnect"/> answers, for an attempt number, whether the control may keep reconnecting.
+/// <paramref name="remoteDesktopSizeChanged"/> receives the size the remote session reports (diagnostics only).
 /// </summary>
 [ComVisible(true)]
 [ClassInterface(ClassInterfaceType.None)]
-public sealed class RdpClientEventSink(Action<Action<RdpConnectionController>> dispatch, Func<int, bool> continueAutoReconnect)
+public sealed class RdpClientEventSink(
+    Action<Action<RdpConnectionController>> dispatch,
+    Func<int, bool> continueAutoReconnect,
+    Action<int, int>? remoteDesktopSizeChanged = null)
     : IMsTscAxEvents
 {
     // AutoReconnectContinueState.autoReconnectContinueStop
@@ -43,6 +48,7 @@ public sealed class RdpClientEventSink(Action<Action<RdpConnectionController>> d
     public void OnLoginComplete() { }
     public void OnDisconnected(int discReason) => dispatch(controller => controller.OnNativeDisconnected(discReason));
     public void OnFatalError(int errorCode) => dispatch(controller => controller.OnNativeFatalError(errorCode));
+    public void OnRemoteDesktopSizeChange(int width, int height) => remoteDesktopSizeChanged?.Invoke(width, height);
 
     // Raised around the control's own modal dialogs. With this control version they bracket the Windows Security
     // credential prompt, which runs outside RDCM while the control waits for it.

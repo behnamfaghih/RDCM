@@ -8,9 +8,10 @@ namespace RDCM;
 /// <summary>
 /// Normal (restored) window bounds plus the maximized flag. Never stores minimized.
 /// <para>
-/// <see cref="Format"/> 2 (RDCM 1.1 and later): physical screen pixels, with <see cref="Dpi"/> the window's DPI when it
-/// was saved. Format 0 (RDCM 1.0, which was system DPI aware): coordinates in the system-DPI space Windows showed that
-/// version, where each monitor appears scaled by system DPI / monitor DPI. Both load; format 2 is always saved.
+/// <see cref="Format"/> 2 (written by per-monitor DPI aware builds): physical screen pixels, with <see cref="Dpi"/> the
+/// window's DPI when it was saved. Format 0 (no Format value; written by earlier, system DPI aware builds): coordinates
+/// in the system-DPI space Windows showed those builds, where each monitor appears scaled by system DPI / monitor DPI.
+/// Both load; format 2 is always saved.
 /// </para>
 /// </summary>
 public sealed class WindowPlacementSettings
@@ -28,7 +29,7 @@ public sealed class WindowPlacementSettings
     public int Height { get; set; }
     public bool Maximized { get; set; }
 
-    /// <summary>Coordinate format; see the class remarks. 0 when the file was written by RDCM 1.0.</summary>
+    /// <summary>Coordinate format; see the class remarks. 0 when the file was written by a system DPI aware build.</summary>
     public int Format { get; set; }
 
     /// <summary>DPI of the window when it was saved (format 2); 0 when unknown.</summary>
@@ -91,7 +92,7 @@ public sealed class WindowPlacementSettings
     }
 
     /// <summary>
-    /// Converts bounds saved by the system-DPI-aware RDCM 1.0 to physical pixels. Windows showed that version every
+    /// Converts bounds saved by an earlier, system DPI aware build to physical pixels. Windows showed those builds every
     /// monitor scaled about the screen origin by system DPI / monitor DPI, so the monitor whose scaled bounds contain
     /// most of the window identifies the factor. Bounds that match no monitor are returned unchanged (and are then
     /// rejected as unreachable unless they happen to be on screen).
@@ -101,7 +102,7 @@ public sealed class WindowPlacementSettings
     {
         var legacy = new Rectangle(saved.Left, saved.Top, saved.Width, saved.Height);
         var match = monitors
-            .Select(monitor => (Monitor: monitor, Overlap: Rectangle.Intersect(Scale(monitor.Bounds, systemDpi, monitor.Dpi), legacy)))
+            .Select(monitor => (Monitor: monitor, Overlap: Rectangle.Intersect(Scale(monitor.Bounds, monitor.Dpi, systemDpi), legacy)))
             .Where(candidate => !candidate.Overlap.IsEmpty)
             .OrderByDescending(candidate => (long)candidate.Overlap.Width * candidate.Overlap.Height)
             .Select(candidate => candidate.Monitor)
@@ -114,10 +115,30 @@ public sealed class WindowPlacementSettings
         from.Rescale(rectangle.Right, to), from.Rescale(rectangle.Bottom, to));
 
     /// <summary>
+    /// The default placement: <paramref name="widthUnits"/> × <paramref name="heightUnits"/> device-independent units at
+    /// the monitor's DPI, centred in its work area and never larger than it.
+    /// </summary>
+    public static WindowPlacementSettings CenteredOn(MonitorDescription monitor, double widthUnits, double heightUnits)
+    {
+        var area = monitor.WorkArea;
+        var width = Math.Min(monitor.Dpi.ToPhysical(widthUnits), area.Width);
+        var height = Math.Min(monitor.Dpi.ToPhysical(heightUnits), area.Height);
+        return new WindowPlacementSettings
+        {
+            Left = area.Left + (area.Width - width) / 2,
+            Top = area.Top + (area.Height - height) / 2,
+            Width = width,
+            Height = height,
+            Format = CurrentFormat,
+            Dpi = monitor.Dpi.Value
+        };
+    }
+
+    /// <summary>
     /// Builds the setting from a window's Win32 placement. A minimized window is saved as normal, or as maximized if it
     /// will restore to maximized, so RDCM never starts minimized.
     /// </summary>
-    internal static WindowPlacementSettings FromNative(int showCommand, int flags, Rectangle normalBounds, RDCM.Dpi dpi) => new()
+    public static WindowPlacementSettings FromNative(int showCommand, int flags, Rectangle normalBounds, RDCM.Dpi dpi) => new()
     {
         Left = normalBounds.Left,
         Top = normalBounds.Top,
@@ -128,9 +149,10 @@ public sealed class WindowPlacementSettings
         Dpi = dpi.Value
     };
 
-    internal const int ShowMinimized = 2;
-    internal const int ShowMaximized = 3;
-    internal const int RestoreToMaximized = 2;
+    /// <summary>Win32 WINDOWPLACEMENT values: SW_SHOWMINIMIZED, SW_SHOWMAXIMIZED, and WPF_RESTORETOMAXIMIZED.</summary>
+    public const int ShowMinimized = 2;
+    public const int ShowMaximized = 3;
+    public const int RestoreToMaximized = 2;
 }
 
 /// <summary>Reads and applies window placement through Win32 so maximized windows keep their restore bounds.</summary>
@@ -176,9 +198,18 @@ public static class WindowPlacementService
             Right = settings.Left + settings.Width,
             Bottom = settings.Top + settings.Height
         });
+        var dpiBefore = MonitorLayout.GetWindowDpi(handle);
         if (!SetWindowPlacement(handle, ref placement))
         {
             AppLog.Warning($"Restoring the window position failed (Win32 error {Marshal.GetLastWin32Error()}).");
+            return;
+        }
+        // The window is created on the primary monitor. Moving it to a monitor with another scale makes Windows send
+        // WM_DPICHANGED, and WPF resizes it to keep the apparent size it had at the DPI it was created at; the bounds
+        // here are already in that monitor's pixels, so they are applied again once the window is on it.
+        if (MonitorLayout.GetWindowDpi(handle) != dpiBefore && !SetWindowPlacement(handle, ref placement))
+        {
+            AppLog.Warning($"Restoring the window size on another monitor failed (Win32 error {Marshal.GetLastWin32Error()}).");
         }
     }
 

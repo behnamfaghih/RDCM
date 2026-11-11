@@ -121,6 +121,7 @@ Run("profile store saves, recovers a backup, and preserves corrupt source", () =
 
 RunLifecycleTests();
 RunPreferenceTests();
+RunDpiTests();
 RunFeatureTests();
 // Runner self-test (opt-in): proves failures and crashes are reported with context rather than lost.
 switch (Environment.GetEnvironmentVariable("RDCM_TESTS_SELF_TEST"))
@@ -1383,7 +1384,7 @@ void RunLifecycleTests()
                 }
                 var identity = SessionIdentity.Capture(Profile("Surface"));
                 var session = new EmbeddedRdpControl(identity);
-                var host = new System.Windows.Forms.Integration.WindowsFormsHost { Child = session };
+                var host = new SessionHost { Child = session };
                 var view = new SessionView();
                 view.AttachSession(session, host);
                 // Shown off-screen and never activated; showing it creates the native control while the surface is hidden.
@@ -1405,6 +1406,16 @@ void RunLifecycleTests()
                 view.Apply(connected);
                 Pump();
                 Assert(TestWindows.HasVisibleStyle(activeX) && TestWindows.IsWindowVisible(activeX));
+
+                // The native surface fills the WPF layout region exactly, in physical pixels at the window's DPI.
+                var container = (System.Windows.FrameworkElement)view.FindName("HostContainer");
+                var scale = System.Windows.Media.VisualTreeHelper.GetDpi(container);
+                var area = session.SessionArea;
+                Assert(area.Dpi.Value == (int)Math.Round(scale.PixelsPerInchX));
+                Assert(area.Width == area.Dpi.ToPhysical(container.ActualWidth) && area.Height == area.Dpi.ToPhysical(container.ActualHeight));
+                var hostWindow = TestWindows.ClientSize(TestWindows.Parent(session.Handle));
+                Assert(Math.Abs(hostWindow.Width - area.Width) <= 1 && Math.Abs(hostWindow.Height - area.Height) <= 1);
+                Assert(TestWindows.ClientSize(session.Handle) == hostWindow && TestWindows.ClientSize(activeX) == hostWindow);
 
                 // Hidden while disconnecting, shown again on the next connection, and nothing takes keyboard focus.
                 view.Apply(connected with { Sequence = 2, State = RdpSessionState.Disconnecting, Message = "Disconnecting…" });
@@ -1640,25 +1651,623 @@ void RunPreferenceTests()
 
     Run("window placement: unreachable or implausible bounds are rejected", () =>
     {
-        IReadOnlyList<System.Drawing.Rectangle> monitors = [new(0, 0, 1920, 1040)];
-        Assert(WindowPlacementSettings.Validate(new() { Left = 5000, Top = 100, Width = 1200, Height = 800 }, monitors) is null);
-        Assert(WindowPlacementSettings.Validate(new() { Left = 100, Top = -2000, Width = 1200, Height = 800 }, monitors) is null);
-        Assert(WindowPlacementSettings.Validate(new() { Left = 0, Top = 0, Width = 10, Height = 10 }, monitors) is null);
-        Assert(WindowPlacementSettings.Validate(new() { Left = 0, Top = 0, Width = 1200, Height = 800 }, []) is null);
-        Assert(WindowPlacementSettings.Validate(null, monitors) is null);
+        IReadOnlyList<MonitorDescription> monitors = [Monitor(0, 0, 1920, 1040)];
+        Assert(WindowPlacementSettings.Validate(Placement(5000, 100, 1200, 800), monitors, new Dpi(96)) is null);
+        Assert(WindowPlacementSettings.Validate(Placement(100, -2000, 1200, 800), monitors, new Dpi(96)) is null);
+        Assert(WindowPlacementSettings.Validate(Placement(0, 0, 10, 10), monitors, new Dpi(96)) is null);
+        Assert(WindowPlacementSettings.Validate(Placement(0, 0, 1200, 800), [], new Dpi(96)) is null);
+        Assert(WindowPlacementSettings.Validate(null, monitors, new Dpi(96)) is null);
     });
 
     Run("window placement: partially visible windows are moved fully on screen", () =>
     {
-        IReadOnlyList<System.Drawing.Rectangle> monitors = [new(0, 0, 1920, 1040), new(1920, 0, 1280, 984)];
-        var clamped = WindowPlacementSettings.Validate(new() { Left = 1500, Top = 500, Width = 1000, Height = 800, Maximized = true }, monitors)!;
+        IReadOnlyList<MonitorDescription> monitors = [Monitor(0, 0, 1920, 1040), Monitor(1920, 0, 1280, 984)];
+        var clamped = WindowPlacementSettings.Validate(Placement(1500, 500, 1000, 800, maximized: true), monitors, new Dpi(96))!;
         // Most of the window is on the second monitor, so it is moved fully onto that monitor.
         Assert(clamped.Left == 1920 && clamped.Top == 184 && clamped.Width == 1000 && clamped.Height == 800 && clamped.Maximized);
-        var inside = WindowPlacementSettings.Validate(new() { Left = 1200, Top = 700, Width = 1000, Height = 600 }, [new(0, 0, 1920, 1040)])!;
+        var inside = WindowPlacementSettings.Validate(Placement(1200, 700, 1000, 600), [Monitor(0, 0, 1920, 1040)], new Dpi(96))!;
         Assert(inside.Left == 920 && inside.Top == 440);
-        var shrunk = WindowPlacementSettings.Validate(new() { Left = 2000, Top = 10, Width = 3000, Height = 2000 }, monitors)!;
+        var shrunk = WindowPlacementSettings.Validate(Placement(2000, 10, 3000, 2000), monitors, new Dpi(96))!;
         Assert(shrunk.Left == 1920 && shrunk.Width == 1280 && shrunk.Height == 984);
+        Assert(clamped.Format == WindowPlacementSettings.CurrentFormat && clamped.Dpi == 96);
     });
+}
+
+// ---------------------------------------------------------------------------------------------
+// Per-monitor DPI
+// ---------------------------------------------------------------------------------------------
+
+// The validation environment: a 175% primary monitor and a 100% monitor above it at negative coordinates.
+static MonitorDescription Monitor(int x, int y, int width, int height, int dpi = 96, bool primary = false, int taskbar = 0) =>
+    new(new(x, y, width, height), new(x, y, width, height - taskbar), new Dpi(dpi), primary);
+
+static IReadOnlyList<MonitorDescription> MixedDpiMonitors() =>
+    [Monitor(0, 0, 2560, 1600, 168, primary: true, taskbar: 84), Monitor(1228, -1080, 1920, 1080, 96, taskbar: 48), Monitor(-692, -1080, 1920, 1080, 96, taskbar: 48)];
+
+static WindowPlacementSettings Placement(int left, int top, int width, int height, bool maximized = false, int format = 0, int dpi = 0) =>
+    new() { Left = left, Top = top, Width = width, Height = height, Maximized = maximized, Format = format, Dpi = dpi };
+
+void RunDpiTests()
+{
+    Run("dpi: device-independent units and physical pixels convert with the window's own DPI", () =>
+    {
+        var standard = new Dpi(96);
+        var large = new Dpi(168);
+        Assert(standard.Percent == 100 && large.Percent == 175 && new Dpi(120).Percent == 125 && new Dpi(144).Percent == 150 && new Dpi(192).Percent == 200);
+        Assert(large.ToPhysical(1000) == 1750 && standard.ToPhysical(1000) == 1000 && new Dpi(120).ToPhysical(1000) == 1250);
+        Assert(Math.Abs(large.ToLogical(1750) - 1000) < 1e-9 && Math.Abs(standard.ToLogical(900) - 900) < 1e-9);
+        // The same apparent size on another monitor: 1575 px at 175% is 900 px at 100%, and back again.
+        Assert(large.Rescale(1575, standard) == 900 && standard.Rescale(900, large) == 1575);
+        Assert(!Dpi.IsPlausible(0) && !Dpi.IsPlausible(5000) && Dpi.IsPlausible(96));
+        AssertThrows<ArgumentOutOfRangeException>(() => _ = new Dpi(0));
+    });
+
+    Run("dpi: the remote desktop matches the session area's physical pixels at 96, 120, 144, 168, and 192 DPI", () =>
+    {
+        var fit = RemoteDisplayOptions.Resolutions[0];
+        var scale = RemoteDisplayOptions.Scales[0];
+        // One tab area of 1000 × 600 device-independent units on monitors with different scaling.
+        var millimeters = new List<(uint, uint)>();
+        foreach (var (value, device) in new[] { (96, 100u), (120, 140u), (144, 140u), (168, 180u), (192, 180u) })
+        {
+            var dpi = new Dpi(value);
+            var area = new SessionAreaMetrics(dpi.ToPhysical(1000), dpi.ToPhysical(600), dpi);
+            var settings = RemoteDisplayPlan.For(fit, scale, area);
+            // Pixel for pixel (rounded down to a multiple of 4): no second scaling of an already physical size.
+            Assert(settings.DesktopWidth == area.Width - area.Width % 4 && settings.DesktopHeight == area.Height - area.Height % 4);
+            Assert(settings.DeviceScaleFactor == device && settings.DesktopScaleFactor == 100);
+            millimeters.Add((settings.PhysicalWidthMillimeters, settings.PhysicalHeightMillimeters));
+        }
+        // The physical size of the tab is the same whatever the monitor's scaling.
+        Assert(millimeters.Distinct().Count() == 1 && millimeters[0] == (265u, 159u));
+        // A fixed resolution is independent of the monitor.
+        var fixedSize = RemoteDisplayPlan.For(RemoteDisplayOptions.Resolutions[5], scale, new SessionAreaMetrics(1750, 1050, new Dpi(168)));
+        Assert(fixedSize is { DesktopWidth: 1920, DesktopHeight: 1080, DeviceScaleFactor: 180 });
+        // The smallest RDCM window on a 100% monitor has a 565 × 380 pixel session area: the remote desktop must not be
+        // larger than it (the control would clip it). Only areas under the documented 200-pixel minimum are enlarged.
+        Assert(RemoteDisplayPlan.DesktopSize(fit, new SessionAreaMetrics(565, 380, new Dpi(96))) == (564, 380));
+        Assert(RemoteDisplayPlan.DesktopSize(fit, new SessionAreaMetrics(150, 90, new Dpi(96))) == (200, 200));
+        Assert(RemoteDisplayPlan.DesktopSize(fit, new SessionAreaMetrics(9000, 9000, new Dpi(96))) == (8192, 8192));
+    });
+
+    Run("dpi: moving a connected session between 100% and 175% monitors resizes the remote desktop once per move", () =>
+    {
+        var (display, client, delay) = DisplayCoordinator(connected: true);
+        display.SetSessionArea(new SessionAreaMetrics(1600, 900, new Dpi(96)));
+        display.OnConnected();
+        delay.Elapse(display);
+        Assert(client.Applied.Count == 1 && client.Applied[0] is { DesktopWidth: 1600, DesktopHeight: 900, DeviceScaleFactor: 100 });
+
+        // 100% to 175%: the window keeps its apparent size, so the area keeps its units and gains physical pixels.
+        display.SetSessionArea(new SessionAreaMetrics(2800, 1575, new Dpi(168)));
+        Assert(client.Applied.Count == 1 && delay.Restarts > 0);
+        delay.Elapse(display);
+        Assert(client.Applied.Count == 2 && client.Applied[1] is { DesktopWidth: 2800, DesktopHeight: 1572, DeviceScaleFactor: 180 });
+        Assert(client.Applied[1].PhysicalWidthMillimeters == client.Applied[0].PhysicalWidthMillimeters);
+
+        // 175% back to 100%.
+        display.SetSessionArea(new SessionAreaMetrics(1600, 900, new Dpi(96)));
+        delay.Elapse(display);
+        Assert(client.Applied.Count == 3 && client.Applied[2] is { DesktopWidth: 1600, DesktopHeight: 900, DeviceScaleFactor: 100 });
+        Assert(display.ActiveResolution.IsFitToTab && display.UpdatesSent == 3);
+    });
+
+    Run("dpi: rapid moves and resizes are coalesced into one remote display update", () =>
+    {
+        var (display, client, delay) = DisplayCoordinator(connected: true);
+        display.SetSessionArea(new SessionAreaMetrics(1600, 900, new Dpi(96)));
+        display.OnConnected();
+        delay.Elapse(display);
+        var restartsBefore = delay.Restarts;
+        for (var i = 0; i < 20; i++)
+        {
+            var dpi = new Dpi(i % 2 == 0 ? 168 : 96);
+            display.SetSessionArea(new SessionAreaMetrics(dpi.ToPhysical(1600 - i), dpi.ToPhysical(900), dpi));
+            display.OnControlResized();
+        }
+        // Every change restarts the settle delay; nothing is sent until it elapses.
+        Assert(client.Applied.Count == 1 && delay.Restarts - restartsBefore == 40);
+        delay.Elapse(display);
+        Assert(client.Applied.Count == 2 && client.Applied[1] is { DesktopWidth: 1580, DesktopHeight: 900, DeviceScaleFactor: 100 });
+        // Nothing changed since: a later settle sends nothing, and an identical area doesn't even restart the delay.
+        delay.Elapse(display);
+        display.SetSessionArea(new SessionAreaMetrics(1581, 900, new Dpi(96)));
+        display.SetSessionArea(new SessionAreaMetrics(1581, 900, new Dpi(96)));
+        delay.Elapse(display);
+        Assert(client.Applied.Count == 2);
+    });
+
+    Run("dpi: a fixed resolution is not renegotiated when the window moves; nothing is sent while disconnected", () =>
+    {
+        var (display, client, delay) = DisplayCoordinator(connected: false);
+        Assert(display.SetResolution(RemoteDisplayOptions.Resolutions[5]) && client.Applied.Count == 0);
+        display.SetSessionArea(new SessionAreaMetrics(2800, 1575, new Dpi(168)));
+        Assert(delay.Restarts == 0 && client.Applied.Count == 0);
+        // The pending preference is what the next connection uses, so connecting needs no display update.
+        Assert(display.SettingsForConnect() is { DesktopWidth: 1920, DesktopHeight: 1080, DesktopScaleFactor: 100, DeviceScaleFactor: 180 });
+        client.Connected = true;
+        display.OnConnected();
+        display.SetSessionArea(new SessionAreaMetrics(1600, 900, new Dpi(96)));
+        delay.Elapse(display);
+        Assert(client.Applied.Count == 0 && delay.Restarts == 0 && display.ActiveResolution == RemoteDisplayOptions.Resolutions[5]);
+    });
+
+    Run("dpi: a fresh control connects with the session area of the monitor the window is on now", () =>
+    {
+        var (display, client, delay) = DisplayCoordinator(connected: false);
+        display.SetSessionArea(new SessionAreaMetrics(1600, 900, new Dpi(96)));
+        Assert(display.SettingsForConnect() is { DesktopWidth: 1600, DesktopHeight: 900, DeviceScaleFactor: 100 });
+        // Moved to the 175% monitor while disconnected, then reconnected with a replacement control.
+        display.SetSessionArea(new SessionAreaMetrics(2800, 1575, new Dpi(168)));
+        Assert(client.Applied.Count == 0 && delay.Restarts == 0);
+        Assert(display.SettingsForConnect() is { DesktopWidth: 2800, DesktopHeight: 1572, DeviceScaleFactor: 180 });
+        client.Connected = true;
+        display.OnConnected();
+        delay.Elapse(display);
+        // Connected at the right size already, so nothing more is sent.
+        Assert(client.Applied.Count == 0 && display.ActiveResolution.IsFitToTab);
+    });
+
+    Run("dpi: a reconnection keeps the remote scaling chosen for the session, set before connecting", () =>
+    {
+        var (display, client, delay) = DisplayCoordinator(connected: false);
+        var statuses = new List<string>();
+        display.StatusChanged += statuses.Add;
+        display.SetSessionArea(new SessionAreaMetrics(1600, 900, new Dpi(96)));
+        Assert(display.SettingsForConnect() is { DesktopScaleFactor: 100 });
+        client.Connected = true;
+        display.OnConnected();
+        // Chosen while connected and accepted by the session.
+        Assert(display.SetScale(RemoteDisplayOptions.Scales[2]) && client.Applied.Count == 1);
+        // Disconnected, then reconnected (for example with a replacement control): the connection itself asks for it.
+        client.Connected = false;
+        Assert(display.SettingsForConnect() is { DesktopWidth: 1600, DesktopHeight: 900 } connect && connect.DesktopScaleFactor == RemoteDisplayOptions.Scales[2].Percent);
+        client.Connected = true;
+        display.OnConnected();
+        delay.Elapse(display);
+        Assert(client.Applied.Count == 1 && display.ActiveScale == RemoteDisplayOptions.Scales[2]);
+        Assert(statuses[^1] == $"Connected · 1600 × 900 · {RemoteDisplayOptions.Scales[2].Percent}%");
+
+        // Chosen while disconnected: the next connection asks for it, and nothing more is sent once connected.
+        client.Connected = false;
+        Assert(display.SetScale(RemoteDisplayOptions.Scales[1]) && client.Applied.Count == 1);
+        Assert(display.SettingsForConnect().DesktopScaleFactor == RemoteDisplayOptions.Scales[1].Percent);
+        client.Connected = true;
+        display.OnConnected();
+        Assert(client.Applied.Count == 1 && display.ActiveScale == RemoteDisplayOptions.Scales[1]);
+    });
+
+    Run("dpi: a scaling changed while signing in, or not accepted before connecting, is sent once connected", () =>
+    {
+        // Changed after Connect, before the session is connected.
+        var (display, client, _) = DisplayCoordinator(connected: false);
+        display.SetSessionArea(new SessionAreaMetrics(2800, 1575, new Dpi(168)));
+        display.SettingsForConnect();
+        Assert(display.SetScale(RemoteDisplayOptions.Scales[1]) && client.Applied.Count == 0);
+        client.Connected = true;
+        display.OnConnected();
+        Assert(client.Applied.Count == 1 && client.Applied[0].DesktopScaleFactor == RemoteDisplayOptions.Scales[1].Percent &&
+               client.Applied[0].DeviceScaleFactor == 180 && display.ActiveScale == RemoteDisplayOptions.Scales[1]);
+
+        // The control couldn't take it before connecting: it connected at 100%, and a rejected update leaves it there.
+        var (other, otherClient, _) = DisplayCoordinator(connected: false);
+        var failures = new List<bool>();
+        other.UpdateFailed += (_, _, notify) => failures.Add(notify);
+        Assert(other.SetScale(RemoteDisplayOptions.Scales[3]));
+        other.SettingsForConnect();
+        other.OnConnectScaleUnavailable();
+        otherClient.Connected = true;
+        otherClient.Reject = true;
+        other.OnConnected();
+        Assert(failures.SequenceEqual([true]) && other.Scale == RemoteDisplayOptions.Scales[0] && other.ActiveScale == RemoteDisplayOptions.Scales[0]);
+    });
+
+    Run("dpi: a rejected display update keeps the session and the last confirmed settings, and is reported once", () =>
+    {
+        var (display, client, delay) = DisplayCoordinator(connected: true);
+        var failures = new List<(string Message, bool Notify)>();
+        var statuses = new List<string>();
+        display.UpdateFailed += (message, _, notify) => failures.Add((message, notify));
+        display.StatusChanged += statuses.Add;
+        display.SetSessionArea(new SessionAreaMetrics(1600, 900, new Dpi(96)));
+        display.OnConnected();
+        client.Reject = true;
+        Assert(!display.SetScale(RemoteDisplayOptions.Scales[3]));
+        Assert(display.Scale == RemoteDisplayOptions.Scales[0] && display.ActiveScale == RemoteDisplayOptions.Scales[0]);
+        display.SetSessionArea(new SessionAreaMetrics(2800, 1575, new Dpi(168)));
+        delay.Elapse(display);
+        Assert(failures.Count == 2 && failures[0].Notify && !failures[1].Notify && client.Applied.Count == 0);
+        // Accepted again later: the next failure is reported again.
+        client.Reject = false;
+        display.SetSessionArea(new SessionAreaMetrics(1600, 900, new Dpi(96)));
+        delay.Elapse(display);
+        Assert(client.Applied.Count == 1 && statuses[^1] == "Connected · 1600 × 900 · 100%");
+        client.Reject = true;
+        display.SetSessionArea(new SessionAreaMetrics(2800, 1575, new Dpi(168)));
+        delay.Elapse(display);
+        Assert(failures.Count == 3 && failures[2].Notify);
+    });
+
+    Run("dpi: display updates go only to the current control; a released one never gets one", () =>
+    {
+        var host = ConnectedHost();
+        var first = host.Current;
+        var applied = new List<int>();
+        var client = new FakeDisplayClient { Connected = true };
+        client.OnApply = _ => applied.Add(host.Slot.Current!.Generation);
+        var delay = new FakeSettleDelay();
+        var display = new RemoteDisplayCoordinator(client, () => host.Controller.State == RdpSessionState.Connected, delay.Restart,
+            () => new SessionAreaMetrics(1024, 768, new Dpi(96)));
+        display.SetSessionArea(new SessionAreaMetrics(1600, 900, new Dpi(96)));
+        display.OnConnected();
+        delay.Elapse(display);
+        Assert(applied.SequenceEqual([1]));
+
+        // A resize just before the connection drops leaves the settle delay running.
+        display.SetSessionArea(new SessionAreaMetrics(1700, 900, new Dpi(96)));
+        Assert(delay.Pending);
+        // Hard Disconnect during auto-reconnect replaces the control; the delay elapsing afterwards, and moves meanwhile,
+        // send nothing.
+        BeginAutoReconnect(host);
+        host.Controller.Disconnect();
+        host.RunPendingWork();
+        Assert(first.Disposed && host.Current.Generation == 2 && host.Controller.State == RdpSessionState.Disconnected);
+        delay.Elapse(display);
+        display.SetSessionArea(new SessionAreaMetrics(2800, 1575, new Dpi(168)));
+        delay.Elapse(display);
+        Assert(applied.SequenceEqual([1]));
+
+        // Reconnect on the fresh control: it connects at the current size, and later updates reach only generation 2.
+        host.StartCurrent();
+        var second = host.Current;
+        Assert(host.Controller.Reconnect() && display.SettingsForConnect() is { DesktopWidth: 2800, DesktopHeight: 1572 });
+        host.Raise(second, controller => controller.OnNativeConnecting());
+        second.State = RdpConnectionController.NativeConnected;
+        host.Raise(second, controller => controller.OnNativeConnected());
+        display.OnConnected();
+        display.SetSessionArea(new SessionAreaMetrics(1600, 900, new Dpi(96)));
+        delay.Elapse(display);
+        Assert(applied.SequenceEqual([1, 2]));
+        Assert(!host.Raise(first, controller => controller.OnNativeDisconnected(516)) && host.Controller.State == RdpSessionState.Connected);
+    });
+
+    Run("dpi: display diagnostics contain only sizes, DPI, and scale factors", () =>
+    {
+        var lines = new List<string>();
+        var listener = new CollectingTraceListener(lines);
+        System.Diagnostics.Trace.Listeners.Add(listener);
+        try
+        {
+            var (display, _, delay) = DisplayCoordinator(connected: true);
+            display.SetSessionArea(new SessionAreaMetrics(2800, 1575, new Dpi(168)));
+            display.OnConnected();
+            delay.Elapse(display);
+        }
+        finally
+        {
+            System.Diagnostics.Trace.Listeners.Remove(listener);
+        }
+        var update = lines.Single(line => line.Contains("Remote display update"));
+        Assert(update.Contains("2800 × 1572 for a 2800 × 1575 area at 168 DPI (175%); desktop scale 100%, device scale 180%."));
+        Assert(System.Text.RegularExpressions.Regex.IsMatch(update, @"^[^@\\/]*$"));
+    });
+
+    Run("window placement: a window saved on the 100% monitor reopens there with the same physical bounds", () =>
+    {
+        var monitors = MixedDpiMonitors();
+        var saved = WindowPlacementSettings.FromNative(1, 0, new System.Drawing.Rectangle(1300, -1000, 900, 560), new Dpi(96));
+        Assert(saved is { Format: 2, Dpi: 96, Maximized: false, Left: 1300, Top: -1000, Width: 900, Height: 560 });
+        var restored = WindowPlacementSettings.Validate(saved, monitors, new Dpi(168))!;
+        Assert(restored is { Left: 1300, Top: -1000, Width: 900, Height: 560, Dpi: 96, Maximized: false });
+        // And on the 175% primary monitor.
+        var primary = WindowPlacementSettings.Validate(Placement(200, 150, 1575, 980, format: 2, dpi: 168), monitors, new Dpi(168))!;
+        Assert(primary is { Left: 200, Top: 150, Width: 1575, Height: 980, Dpi: 168 });
+        // On the monitor at negative coordinates to the left.
+        var left = WindowPlacementSettings.Validate(Placement(-600, -1000, 900, 560, format: 2, dpi: 96), monitors, new Dpi(168))!;
+        Assert(left is { Left: -600, Top: -1000, Width: 900, Height: 560 });
+    });
+
+    Run("window placement: maximized windows restore maximized on either monitor; minimized is never the start state", () =>
+    {
+        var monitors = MixedDpiMonitors();
+        var maximized100 = WindowPlacementSettings.FromNative(3, 0, new System.Drawing.Rectangle(1300, -1000, 900, 560), new Dpi(96));
+        var maximized175 = WindowPlacementSettings.FromNative(3, 0, new System.Drawing.Rectangle(200, 150, 1575, 980), new Dpi(168));
+        Assert(WindowPlacementSettings.Validate(maximized100, monitors, new Dpi(168)) is { Maximized: true, Left: 1300, Width: 900 });
+        Assert(WindowPlacementSettings.Validate(maximized175, monitors, new Dpi(168)) is { Maximized: true, Left: 200, Width: 1575 });
+        var minimized = WindowPlacementSettings.FromNative(WindowPlacementSettings.ShowMinimized, 0, new System.Drawing.Rectangle(200, 150, 1575, 980), new Dpi(168));
+        var minimizedFromMaximized = WindowPlacementSettings.FromNative(WindowPlacementSettings.ShowMinimized, WindowPlacementSettings.RestoreToMaximized,
+            new System.Drawing.Rectangle(200, 150, 1575, 980), new Dpi(168));
+        Assert(!minimized.Maximized && minimizedFromMaximized.Maximized);
+        Assert(WindowPlacementSettings.Validate(minimized, monitors, new Dpi(168)) is { Maximized: false, Width: 1575 });
+    });
+
+    Run("window placement: a window saved at another scale keeps its apparent size", () =>
+    {
+        // Saved at 175%, and the same monitor is now at 100% (or the window lands on a 100% monitor).
+        IReadOnlyList<MonitorDescription> monitors = [Monitor(0, 0, 2560, 1600, 96, primary: true, taskbar: 48)];
+        var rescaled = WindowPlacementSettings.Validate(Placement(200, 150, 1575, 980, format: 2, dpi: 168), monitors, new Dpi(96))!;
+        Assert(rescaled is { Left: 200, Top: 150, Width: 900, Height: 560, Dpi: 96 });
+        // Saved at 100% and now at 150%: larger, but never larger than the work area.
+        IReadOnlyList<MonitorDescription> scaledUp = [Monitor(0, 0, 1920, 1080, 144, primary: true, taskbar: 72)];
+        var enlarged = WindowPlacementSettings.Validate(Placement(100, 50, 1200, 800, format: 2, dpi: 96), scaledUp, new Dpi(144))!;
+        Assert(enlarged is { Width: 1800, Height: 1008, Left: 100, Top: 0, Dpi: 144 });
+    });
+
+    Run("window placement: settings from system DPI aware builds (no Format) are converted to physical pixels", () =>
+    {
+        var monitors = MixedDpiMonitors();
+        // A system DPI aware build at 168 system DPI saw the 100% monitor scaled by 1.75: physical (1300,-1000) 900 × 560 was saved as:
+        var legacy = Placement(2275, -1750, 1575, 980);
+        var converted = WindowPlacementSettings.Validate(legacy, monitors, new Dpi(168))!;
+        Assert(converted is { Left: 1300, Top: -1000, Width: 900, Height: 560, Dpi: 96, Format: 2 });
+        // On the primary monitor (system DPI) legacy coordinates are already physical.
+        var primary = WindowPlacementSettings.Validate(Placement(200, 150, 1575, 980, maximized: true), monitors, new Dpi(168))!;
+        Assert(primary is { Left: 200, Top: 150, Width: 1575, Height: 980, Dpi: 168, Maximized: true });
+        // The left monitor at negative coordinates.
+        var left = WindowPlacementSettings.Validate(Placement(-1050, -1750, 1575, 980), monitors, new Dpi(168))!;
+        Assert(left is { Left: -600, Top: -1000, Width: 900, Height: 560 });
+        // A file without the new fields is a legacy file.
+        var parsed = System.Text.Json.JsonSerializer.Deserialize<WindowPlacementSettings>("""{"Left":200,"Top":150,"Width":1575,"Height":980,"Maximized":false}""")!;
+        Assert(parsed.Format == 0 && parsed.Dpi == 0);
+    });
+
+    Run("window placement: a missing monitor, a changed primary monitor, or corrupt values never place the window off-screen", () =>
+    {
+        // Saved on the 100% monitor, which is now disconnected.
+        IReadOnlyList<MonitorDescription> laptopOnly = [Monitor(0, 0, 2560, 1600, 168, primary: true, taskbar: 84)];
+        Assert(WindowPlacementSettings.Validate(Placement(1300, -1000, 900, 560, format: 2, dpi: 96), laptopOnly, new Dpi(168)) is null);
+        Assert(WindowPlacementSettings.Validate(Placement(2275, -1750, 1575, 980), laptopOnly, new Dpi(168)) is null);
+        // The 100% monitor became primary at the origin and the laptop moved below it; the saved position is now on the
+        // 100% monitor, so the window keeps its apparent size there.
+        IReadOnlyList<MonitorDescription> swapped = [Monitor(0, 0, 1920, 1080, 96, primary: true, taskbar: 48), Monitor(0, 1080, 2560, 1600, 168, taskbar: 84)];
+        Assert(WindowPlacementSettings.Validate(Placement(200, 150, 1575, 980, format: 2, dpi: 168), swapped, new Dpi(96)) is { Left: 200, Top: 150, Width: 900, Height: 560, Dpi: 96 });
+        // An implausible DPI is treated as a legacy value and still validated against the monitors.
+        Assert(WindowPlacementSettings.Validate(Placement(200, 150, 1575, 980, format: 2, dpi: 5000), MixedDpiMonitors(), new Dpi(168)) is { Left: 200, Width: 1575 });
+        Assert(WindowPlacementSettings.Validate(Placement(int.MaxValue, 0, 900, 560, format: 2, dpi: 96), MixedDpiMonitors(), new Dpi(168)) is null);
+        // The settings store drops a corrupt placement entirely.
+        var settings = new AppSettings { MainWindow = Placement(0, 0, -5, 10, format: 2, dpi: 96) };
+        settings.Normalize();
+        Assert(settings.MainWindow is null);
+    });
+
+    Run("window placement: without a usable saved position the window opens centred on the monitor at that monitor's DPI", () =>
+    {
+        var monitors = MixedDpiMonitors();
+        // 1280 × 800 units: 2240 × 1400 pixels on the 175% monitor, 1280 × 800 on a 100% one; centred in the work area.
+        Assert(WindowPlacementSettings.CenteredOn(monitors[0], 1280, 800) is { Left: 160, Top: 58, Width: 2240, Height: 1400, Dpi: 168, Format: 2, Maximized: false });
+        Assert(WindowPlacementSettings.CenteredOn(monitors[1], 1280, 800) is { Left: 1548, Top: -964, Width: 1280, Height: 800, Dpi: 96 });
+        Assert(WindowPlacementSettings.CenteredOn(monitors[2], 1280, 800) is { Left: -372, Top: -964, Width: 1280, Height: 800 });
+        // Never larger than a small monitor's work area.
+        var small = Monitor(0, 0, 1366, 768, 120, primary: true, taskbar: 48);
+        Assert(WindowPlacementSettings.CenteredOn(small, 1280, 800) is { Left: 0, Top: 0, Width: 1366, Height: 720, Dpi: 120 });
+        // The result is itself a valid placement on that monitor.
+        Assert(WindowPlacementSettings.Validate(WindowPlacementSettings.CenteredOn(monitors[1], 1280, 800), monitors, new Dpi(168)) is { Left: 1548, Width: 1280, Dpi: 96 });
+    });
+
+    Run("dpi: the application manifest declares PerMonitorV2 awareness (with system awareness as the fallback)", () =>
+    {
+        var manifest = ReadEmbeddedManifest(Path.Combine(AppContext.BaseDirectory, "RDCM.exe"));
+        var document = System.Xml.Linq.XDocument.Parse(manifest);
+        var awareness = document.Descendants().Single(element => element.Name.LocalName == "dpiAwareness");
+        var aware = document.Descendants().Single(element => element.Name.LocalName == "dpiAware");
+        Assert(awareness.Value.Trim() == "PerMonitorV2" && awareness.Name.NamespaceName == "http://schemas.microsoft.com/SMI/2016/WindowsSettings");
+        Assert(aware.Value.Trim() == "true" && aware.Name.NamespaceName == "http://schemas.microsoft.com/SMI/2005/WindowsSettings");
+        Assert(document.Descendants().Single(element => element.Name.LocalName == "requestedExecutionLevel").Attribute("level")?.Value == "asInvoker");
+    });
+
+    Run("dpi: the real Remote Desktop control takes the remote scaling and device scale factor before connecting", () =>
+    {
+        Exception? failure = null;
+        var thread = new Thread(() =>
+        {
+            object? control = null;
+            try
+            {
+                // The same class RDCM hosts (MsRdpClient9NotSafeForScripting); nothing connects.
+                control = Activator.CreateInstance(Type.GetTypeFromCLSID(new Guid("8B918B82-7985-4C24-89DF-C33AD2BBFBCD"), throwOnError: true)!)!;
+                RdpExtendedSettings.SetScaleFactors(control, 150, 180);
+                Assert(RdpExtendedSettings.GetUInt32(control, "DesktopScaleFactor") == 150);
+                Assert(RdpExtendedSettings.GetUInt32(control, "DeviceScaleFactor") == 180);
+                RdpExtendedSettings.SetScaleFactors(control, 100, 100);
+                Assert(RdpExtendedSettings.GetUInt32(control, "DesktopScaleFactor") == 100 && RdpExtendedSettings.GetUInt32(control, "DeviceScaleFactor") == 100);
+                var rejected = false;
+                try
+                {
+                    RdpExtendedSettings.SetScaleFactors(control, 100, 123);
+                }
+                catch (Exception exception) when (exception is ArgumentException or System.Runtime.InteropServices.COMException)
+                {
+                    rejected = true;
+                }
+                Assert(rejected && RdpExtendedSettings.GetUInt32(control, "DeviceScaleFactor") == 100);
+            }
+            catch (Exception exception)
+            {
+                failure = exception;
+            }
+            finally
+            {
+                if (control is not null)
+                {
+                    System.Runtime.InteropServices.Marshal.FinalReleaseComObject(control);
+                }
+            }
+        });
+        thread.SetApartmentState(ApartmentState.STA);
+        thread.Start();
+        thread.Join();
+        if (failure is not null)
+        {
+            System.Runtime.ExceptionServices.ExceptionDispatchInfo.Capture(failure).Throw();
+        }
+    });
+
+    if (MonitorLayout.GetMonitors().Select(monitor => monitor.Dpi).Distinct().Count() < 2)
+    {
+        Console.WriteLine("NOTE window placement and session tabs across monitor scales were not tested: they need monitors with different scales.");
+        return;
+    }
+    Run("window placement: a window created on one monitor opens on a monitor with another scale at exactly the saved pixel bounds", () =>
+    {
+        Exception? failure = null;
+        var thread = new Thread(() =>
+        {
+            try
+            {
+                var window = new System.Windows.Window
+                {
+                    Width = 1280,
+                    Height = 800,
+                    ShowActivated = false,
+                    ShowInTaskbar = false,
+                    WindowStartupLocation = System.Windows.WindowStartupLocation.Manual
+                };
+                WindowPlacementSettings? placement = null;
+                Dpi? creationDpi = null;
+                window.SourceInitialized += (_, _) =>
+                {
+                    var handle = new System.Windows.Interop.WindowInteropHelper(window).Handle;
+                    creationDpi = MonitorLayout.GetWindowDpi(handle);
+                    var target = MonitorLayout.GetMonitors().First(monitor => monitor.Dpi != creationDpi);
+                    // Larger than any minimum size, so a rescale to the other monitor's DPI would show.
+                    placement = WindowPlacementSettings.CenteredOn(target, 1200, 760);
+                    WindowPlacementService.Apply(window, placement);
+                };
+                window.Show();
+                var frame = new System.Windows.Threading.DispatcherFrame();
+                System.Windows.Threading.Dispatcher.CurrentDispatcher.BeginInvoke(
+                    System.Windows.Threading.DispatcherPriority.ApplicationIdle, () => frame.Continue = false);
+                System.Windows.Threading.Dispatcher.PushFrame(frame);
+
+                var hwnd = new System.Windows.Interop.WindowInteropHelper(window).Handle;
+                var bounds = TestWindows.Bounds(hwnd);
+                var dpi = MonitorLayout.GetWindowDpi(hwnd);
+                var actual = (window.ActualWidth, window.ActualHeight);
+                window.Close();
+                Assert(placement is not null && creationDpi is not null && dpi != creationDpi && dpi == new Dpi(placement.Dpi));
+                Assert(bounds == new System.Drawing.Rectangle(placement!.Left, placement.Top, placement.Width, placement.Height));
+                Assert(Math.Abs(actual.ActualWidth - 1200) < 0.5 && Math.Abs(actual.ActualHeight - 760) < 0.5);
+            }
+            catch (Exception exception)
+            {
+                failure = exception;
+            }
+        });
+        thread.SetApartmentState(ApartmentState.STA);
+        thread.Start();
+        thread.Join();
+        if (failure is not null)
+        {
+            System.Runtime.ExceptionServices.ExceptionDispatchInfo.Capture(failure).Throw();
+        }
+    });
+
+    Run("session view: a session tab shown again after the window moved to another scale measures its area at the new DPI", () =>
+    {
+        Exception? failure = null;
+        var thread = new Thread(() =>
+        {
+            try
+            {
+                if (System.Windows.Application.Current is null)
+                {
+                    var app = new System.Windows.Application { ShutdownMode = System.Windows.ShutdownMode.OnExplicitShutdown };
+                    app.Resources.MergedDictionaries.Add(new System.Windows.ResourceDictionary
+                    {
+                        Source = new Uri("pack://application:,,,/RDCM;component/Themes/Controls.xaml")
+                    });
+                }
+                static void Pump()
+                {
+                    var frame = new System.Windows.Threading.DispatcherFrame();
+                    System.Windows.Threading.Dispatcher.CurrentDispatcher.BeginInvoke(
+                        System.Windows.Threading.DispatcherPriority.ApplicationIdle, () => frame.Continue = false);
+                    System.Windows.Threading.Dispatcher.PushFrame(frame);
+                }
+                var session = new EmbeddedRdpControl(SessionIdentity.Capture(Profile("Hidden tab")));
+                var host = new SessionHost { Child = session };
+                // A fixed size in device-independent units, so the move itself causes no SizeChanged in the session area.
+                var view = new SessionView { Width = 800, Height = 500 };
+                view.AttachSession(session, host);
+                var other = new System.Windows.Controls.TabItem { Header = "Other", Content = new System.Windows.Controls.Border() };
+                var sessionTab = new System.Windows.Controls.TabItem { Header = "Session", Content = view };
+                var tabs = new System.Windows.Controls.TabControl { Items = { sessionTab, other } };
+                var window = new System.Windows.Window
+                {
+                    Content = tabs,
+                    SizeToContent = System.Windows.SizeToContent.WidthAndHeight,
+                    ShowActivated = false,
+                    ShowInTaskbar = false,
+                    WindowStartupLocation = System.Windows.WindowStartupLocation.Manual,
+                    Left = 0,
+                    Top = 0
+                };
+                window.Show();
+                Pump();
+                var hwnd = new System.Windows.Interop.WindowInteropHelper(window).Handle;
+                var before = session.SessionArea;
+                Assert(before.Dpi == MonitorLayout.GetWindowDpi(hwnd));
+
+                // Hide the session tab, move the window to a monitor with another scale, then show the tab again.
+                tabs.SelectedItem = other;
+                Pump();
+                var target = MonitorLayout.GetMonitors().First(monitor => monitor.Dpi != before.Dpi);
+                TestWindows.MoveWithoutResizing(hwnd, target.WorkArea.Left + 40, target.WorkArea.Top + 40);
+                Pump();
+                Assert(MonitorLayout.GetWindowDpi(hwnd) == target.Dpi);
+                tabs.SelectedItem = sessionTab;
+                Pump();
+                var container = (System.Windows.FrameworkElement)view.FindName("HostContainer");
+                var after = session.SessionArea;
+                session.Dispose();
+                host.Dispose();
+                window.Close();
+                Assert(after.Dpi == target.Dpi);
+                Assert(after.Width == target.Dpi.ToPhysical(container.ActualWidth) && after.Height == target.Dpi.ToPhysical(container.ActualHeight));
+            }
+            catch (Exception exception)
+            {
+                failure = exception;
+            }
+        });
+        thread.SetApartmentState(ApartmentState.STA);
+        thread.Start();
+        thread.Join();
+        if (failure is not null)
+        {
+            System.Runtime.ExceptionServices.ExceptionDispatchInfo.Capture(failure).Throw();
+        }
+    });
+}
+
+(RemoteDisplayCoordinator Display, FakeDisplayClient Client, FakeSettleDelay Delay) DisplayCoordinator(bool connected)
+{
+    var client = new FakeDisplayClient { Connected = connected };
+    var delay = new FakeSettleDelay();
+    var display = new RemoteDisplayCoordinator(client, () => client.Connected, delay.Restart,
+        () => new SessionAreaMetrics(1024, 768, new Dpi(96)));
+    return (display, client, delay);
+}
+
+/// <summary>The application manifest (RT_MANIFEST resource 1) embedded in an executable.</summary>
+static string ReadEmbeddedManifest(string path)
+{
+    var module = NativeResources.LoadLibraryEx(path, IntPtr.Zero, 0x2 /* LOAD_LIBRARY_AS_DATAFILE */);
+    Assert(module != IntPtr.Zero);
+    try
+    {
+        var resource = NativeResources.FindResource(module, 1, 24);
+        Assert(resource != IntPtr.Zero);
+        var size = NativeResources.SizeofResource(module, resource);
+        var pointer = NativeResources.LockResource(NativeResources.LoadResource(module, resource));
+        var bytes = new byte[size];
+        System.Runtime.InteropServices.Marshal.Copy(pointer, bytes, 0, (int)size);
+        return System.Text.Encoding.UTF8.GetString(bytes).TrimStart('\uFEFF');
+    }
+    finally
+    {
+        NativeResources.FreeLibrary(module);
+    }
 }
 
 void Run(string name, Action test)
@@ -2001,4 +2610,107 @@ static class TestWindows
 
     /// <summary>The window's own WS_VISIBLE style, regardless of its parents.</summary>
     public static bool HasVisibleStyle(IntPtr hwnd) => (GetWindowLong(hwnd, -16) & 0x10000000) != 0;
+
+    [System.Runtime.InteropServices.DllImport("user32.dll")]
+    private static extern bool GetClientRect(IntPtr hwnd, out NativeRect rect);
+
+    [System.Runtime.InteropServices.DllImport("user32.dll")]
+    public static extern IntPtr GetParent(IntPtr hwnd);
+
+    private struct NativeRect
+    {
+        public int Left, Top, Right, Bottom;
+    }
+
+    public static IntPtr Parent(IntPtr hwnd) => GetParent(hwnd);
+
+    [System.Runtime.InteropServices.DllImport("user32.dll")]
+    private static extern bool SetWindowPos(IntPtr hwnd, IntPtr after, int x, int y, int cx, int cy, uint flags);
+
+    /// <summary>SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE: Windows then rescales the window for the new monitor's DPI.</summary>
+    public static void MoveWithoutResizing(IntPtr hwnd, int x, int y) => SetWindowPos(hwnd, IntPtr.Zero, x, y, 0, 0, 0x0001 | 0x0004 | 0x0010);
+
+    [System.Runtime.InteropServices.DllImport("user32.dll")]
+    private static extern bool GetWindowRect(IntPtr hwnd, out NativeRect rect);
+
+    public static System.Drawing.Rectangle Bounds(IntPtr hwnd)
+    {
+        GetWindowRect(hwnd, out var rect);
+        return System.Drawing.Rectangle.FromLTRB(rect.Left, rect.Top, rect.Right, rect.Bottom);
+    }
+
+    public static System.Drawing.Size ClientSize(IntPtr hwnd)
+    {
+        GetClientRect(hwnd, out var rect);
+        return new System.Drawing.Size(rect.Right - rect.Left, rect.Bottom - rect.Top);
+    }
+}
+
+/// <summary>Records display updates; can reject them as a server without dynamic display support would.</summary>
+sealed class FakeDisplayClient : IRemoteDisplayClient
+{
+    public readonly List<RemoteDisplaySettings> Applied = [];
+    public bool Connected { get; set; }
+    public bool Reject { get; set; }
+    public Action<RemoteDisplaySettings>? OnApply { get; set; }
+
+    public void Apply(RemoteDisplaySettings settings)
+    {
+        if (Reject)
+        {
+            throw new RemoteDisplayUpdateException("The remote computer rejected the display change.",
+                new System.Runtime.InteropServices.COMException("simulated", unchecked((int)0x80004005)));
+        }
+        Applied.Add(settings);
+        OnApply?.Invoke(settings);
+    }
+}
+
+/// <summary>The settle delay as a restartable timer: it fires only if started since it last fired.</summary>
+sealed class FakeSettleDelay
+{
+    public int Restarts { get; private set; }
+    public bool Pending { get; private set; }
+
+    public void Restart()
+    {
+        Restarts++;
+        Pending = true;
+    }
+
+    public void Elapse(RemoteDisplayCoordinator display)
+    {
+        if (Pending)
+        {
+            Pending = false;
+            display.OnSettleDelayElapsed();
+        }
+    }
+}
+
+sealed class CollectingTraceListener(List<string> lines) : System.Diagnostics.TraceListener
+{
+    public override void Write(string? message) => lines.Add(message ?? "");
+    public override void WriteLine(string? message) => lines.Add(message ?? "");
+}
+
+static class NativeResources
+{
+    [System.Runtime.InteropServices.DllImport("kernel32.dll", CharSet = System.Runtime.InteropServices.CharSet.Unicode, SetLastError = true)]
+    public static extern IntPtr LoadLibraryEx(string path, IntPtr file, uint flags);
+
+    [System.Runtime.InteropServices.DllImport("kernel32.dll")]
+    public static extern bool FreeLibrary(IntPtr module);
+
+    [System.Runtime.InteropServices.DllImport("kernel32.dll")]
+    public static extern IntPtr FindResource(IntPtr module, nint name, nint type);
+
+    [System.Runtime.InteropServices.DllImport("kernel32.dll")]
+    public static extern uint SizeofResource(IntPtr module, IntPtr resource);
+
+    [System.Runtime.InteropServices.DllImport("kernel32.dll")]
+    public static extern IntPtr LoadResource(IntPtr module, IntPtr resource);
+
+    [System.Runtime.InteropServices.DllImport("kernel32.dll")]
+    public static extern IntPtr LockResource(IntPtr data);
 }
