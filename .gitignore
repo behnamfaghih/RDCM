@@ -5,3 +5,4 @@ obj/
 *.suo
 # Local test-server details: never commit
 Real RDP server.txt
+lastest_git_results.txt
