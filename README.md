@@ -4,11 +4,11 @@ RDCM is a Windows WPF manager for saved Remote Desktop (RDP) connection profiles
 
 ## License
 
-RDCM's original source code is available under the [MIT License](LICENSE). The Windows Remote Desktop components supplied by Windows and the WiX installer toolchain retain their own terms. See the [v1.0.0 preview release notes](docs/releases/v1.0.0.md); an installer released as a prerelease candidate is not a claim of full manual or production validation.
+RDCM's original source code is available under the [MIT License](LICENSE). The Windows Remote Desktop components supplied by Windows and the WiX installer toolchain retain their own terms. See the [v1.0.0 stable release notes](docs/releases/v1.0.0.md) for automated test evidence, maintainer-reported manual validation, download verification and the unsigned-installer limitation.
 
 ## Install
 
-The [v1.0.0 prerelease](https://github.com/behnamfaghih/RDCM/releases/tag/v1.0.0) provides a CI-built **preview MSI**, if the Windows validation workflow has succeeded. Download `RDCM-<version>-win-x64.msi` and its matching SHA-256 checksum from the release assets. The installer is **unsigned and not yet manually production-validated**; see the [preview release notes](docs/releases/v1.0.0.md) for verified automated checks and remaining manual tests. RDCM installs for your Windows account only, without administrator rights, into `%LOCALAPPDATA%\Programs\RDCM`, and adds **RDCM - Remote Connection Manager** to the Start menu (no desktop shortcut) and to **Settings > Apps > Installed apps**. Nothing else on the computer changes: no services, firewall rules, saved credentials, or policies.
+The [v1.0.0 stable release](https://github.com/behnamfaghih/RDCM/releases/tag/v1.0.0) provides a CI-built Windows installer. Download `RDCM-<version>-win-x64.msi` together with its matching SHA-256 checksum from the release assets. The project maintainer reports completing manual checks of the **GitHub-downloaded installer**; see the [release notes](docs/releases/v1.0.0.md) for the separately recorded automated evidence and the remaining limitation: **the installer is unsigned**. RDCM installs for your Windows account only, without administrator rights, into `%LOCALAPPDATA%\Programs\RDCM`, and adds **RDCM - Remote Connection Manager** to the Start menu (no desktop shortcut) and to **Settings > Apps > Installed apps**. Nothing else on the computer changes: no services, firewall rules, saved credentials, or policies.
 
 Requirements: 64-bit Windows 10 or 11 with the built-in Remote Desktop client (`mstscax.dll`), and the **.NET 10 Desktop Runtime (x64)** from <https://dotnet.microsoft.com/download/dotnet/10.0>. The installer checks for the runtime first and stops with a message if it's missing.
 
