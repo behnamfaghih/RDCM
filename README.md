@@ -2,9 +2,13 @@
 
 RDCM is a Windows WPF manager for saved Remote Desktop (RDP) connection profiles. Connect directly from RDCM and view each remote desktop in its own in-app workspace tab, powered by the Windows Remote Desktop ActiveX control. RDCM does not launch the separate `mstsc.exe` client.
 
+## License
+
+RDCM's original source code is available under the [MIT License](LICENSE). The Windows Remote Desktop components supplied by Windows and the WiX installer toolchain retain their own terms. See the [first source preview notes](docs/releases/v1.0.0.md); Windows MSI binaries are released only after the installer and live RDP validation described below.
+
 ## Install
 
-Download `RDCM-<version>-win-x64.msi` and open it. RDCM installs for your Windows account only, without administrator rights, into `%LOCALAPPDATA%\Programs\RDCM`, and adds **RDCM - Remote Connection Manager** to the Start menu (no desktop shortcut) and to **Settings > Apps > Installed apps**. Nothing else on the computer changes: no services, firewall rules, saved credentials, or policies.
+When a validated MSI is published in [GitHub Releases](https://github.com/behnamfaghih/RDCM/releases), download `RDCM-<version>-win-x64.msi` and open it. The initial v1.0.0 release is a **source-only preview**; no independently validated installer is provided yet. RDCM installs for your Windows account only, without administrator rights, into `%LOCALAPPDATA%\Programs\RDCM`, and adds **RDCM - Remote Connection Manager** to the Start menu (no desktop shortcut) and to **Settings > Apps > Installed apps**. Nothing else on the computer changes: no services, firewall rules, saved credentials, or policies.
 
 Requirements: 64-bit Windows 10 or 11 with the built-in Remote Desktop client (`mstscax.dll`), and the **.NET 10 Desktop Runtime (x64)** from <https://dotnet.microsoft.com/download/dotnet/10.0>. The installer checks for the runtime first and stops with a message if it's missing.
 
