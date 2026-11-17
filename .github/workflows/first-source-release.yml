@@ -43,7 +43,7 @@ jobs:
             RDCM-1.0.0-win-x64.msi.sha256
           if-no-files-found: error
 
-  promote-v1.0.0-stable:
+  promote-v1-0-0-stable:
     name: Promote existing release after maintainer sign-off
     if: ${{ github.event_name == 'push' && startsWith(github.event.head_commit.message, 'release: mark RDCM v1.0.0 stable') }}
     needs: windows-release-candidate
