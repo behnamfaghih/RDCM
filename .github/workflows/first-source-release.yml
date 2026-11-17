@@ -1,4 +1,4 @@
-name: First source preview and Windows build
+name: RDCM v1.0.0 validation and stable release
 
 on:
   push:
@@ -43,64 +43,46 @@ jobs:
             RDCM-1.0.0-win-x64.msi.sha256
           if-no-files-found: error
 
-  publish-source-preview:
+  promote-v1.0.0-stable:
+    name: Promote existing release after maintainer sign-off
+    if: ${{ github.event_name == 'push' && startsWith(github.event.head_commit.message, 'release: mark RDCM v1.0.0 stable') }}
     needs: windows-release-candidate
-    name: Publish v1.0.0 Windows installer preview
     runs-on: ubuntu-latest
     permissions:
       contents: write
     steps:
       - uses: actions/checkout@v4
-      - name: Download tested MSI and checksum
-        uses: actions/download-artifact@v4
-        with:
-          name: RDCM-1.0.0-windows-release-candidate
-          path: release-assets
-      - name: Publish a preview MSI, keeping the release marked as prerelease
+      - name: Verify the published release asset before promotion
         env:
           GH_TOKEN: ${{ github.token }}
         shell: bash
         run: |
           set -euo pipefail
-          msi="$(find release-assets -type f -name 'RDCM-1.0.0-win-x64.msi' -print -quit)"
-          if [[ -z "$msi" ]]; then
-            echo "MSI absent from the downloaded CI artifact" >&2
+          expected='sha256:dd4356dfa979fb8d423cd06c3e9a37666ec91aff4f111ccafe32133eca5bfb8a'
+          actual="$(gh api "repos/$GITHUB_REPOSITORY/releases/tags/v1.0.0" \
+            --jq '.assets[] | select(.name == "RDCM-1.0.0-win-x64.msi") | .digest')"
+          if [[ "$actual" != "$expected" ]]; then
+            echo "Refusing stable promotion: published MSI checksum is missing or changed" >&2
             exit 1
           fi
-          if [[ "$msi" != "release-assets/RDCM-1.0.0-win-x64.msi" ]]; then
-            cp "$msi" release-assets/RDCM-1.0.0-win-x64.msi
+          asset_count="$(gh api "repos/$GITHUB_REPOSITORY/releases/tags/v1.0.0" \
+            --jq '[.assets[].name | select(. == "RDCM-1.0.0-win-x64.msi" or . == "RDCM-1.0.0-win-x64.msi.sha256")] | length')"
+          if [[ "$asset_count" != "2" ]]; then
+            echo "Refusing stable promotion: expected MSI/checksum asset pair is incomplete" >&2
+            exit 1
           fi
-          (cd release-assets && sha256sum -c RDCM-1.0.0-win-x64.msi.sha256)
-
-          if ! gh release view v1.0.0 --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
-            gh release create v1.0.0 \
-              --repo "$GITHUB_REPOSITORY" \
-              --target "$GITHUB_SHA" \
-              --title "RDCM v1.0.0 — Windows installer preview" \
-              --notes-file docs/releases/v1.0.0.md \
-              --prerelease
-          fi
-
-          assets="$(gh release view v1.0.0 --repo "$GITHUB_REPOSITORY" --json assets --jq '.assets[].name')"
-          if grep -qx 'RDCM-1.0.0-win-x64.msi' <<< "$assets"; then
-            if ! grep -qx 'RDCM-1.0.0-win-x64.msi.sha256' <<< "$assets"; then
-              echo "MSI present without its checksum; refusing partial release update" >&2
-              exit 1
-            fi
-            echo "Previously published MSI and checksum found; preserving assets."
-          else
-            if grep -qx 'RDCM-1.0.0-win-x64.msi.sha256' <<< "$assets"; then
-              echo "Checksum present without MSI; refusing partial release update" >&2
-              exit 1
-            fi
-            gh release upload v1.0.0 \
-              release-assets/RDCM-1.0.0-win-x64.msi \
-              release-assets/RDCM-1.0.0-win-x64.msi.sha256 \
-              --repo "$GITHUB_REPOSITORY"
-          fi
-
+          echo "Verified original published MSI identity: $actual"
+      - name: Mark v1.0.0 as stable
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
           gh release edit v1.0.0 \
             --repo "$GITHUB_REPOSITORY" \
-            --title "RDCM v1.0.0 — Windows installer preview" \
+            --title "RDCM v1.0.0" \
             --notes-file docs/releases/v1.0.0.md \
-            --prerelease
+            --prerelease=false \
+            --latest
+          gh api "repos/$GITHUB_REPOSITORY/releases/tags/v1.0.0" \
+            --jq '{name, prerelease, draft, tag_name}'
