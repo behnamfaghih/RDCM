@@ -1,0 +1,30 @@
+name: Copilot attribution guard
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  check-copilot-attribution:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Check commit attribution
+        shell: bash
+        run: |
+          set -euo pipefail
+          if git log --all --format='%B' | grep -Eim1 '^[[:space:]]*Co-authored-by:[[:space:]]*Copilot([[:space:]]|<)'; then
+            echo "::error::Copilot co-author trailer found in repository history."
+            exit 1
+          fi
+          if git log --all --format='%an <%ae>%n%cn <%ce>' | grep -Eim1 '(^Copilot[[:space:]]*<|<copilot@github[.]com>)'; then
+            echo "::error::Copilot author/committer identity found in repository history."
+            exit 1
+          fi
+          echo "PASS: no Copilot author, committer, or co-author attribution in checked Git refs."
