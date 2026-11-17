@@ -24,6 +24,9 @@ jobs:
         run: dotnet run --project .\RDCM.Tests\RDCM.Tests.csproj -c Release --no-restore
       - name: Build MSI candidate
         run: dotnet build .\installer\RDCM.Installer.wixproj -c Release --nologo
+      - name: Smoke-test MSI installation and uninstall
+        shell: pwsh
+        run: ./.github/scripts/SmokeTest-RdcmInstaller.ps1 -InstallerPath ./installer/bin/x64/Release/RDCM-1.0.0-win-x64.msi
       - name: Generate SHA-256 checksum
         shell: pwsh
         run: |
@@ -42,25 +45,62 @@ jobs:
 
   publish-source-preview:
     needs: windows-release-candidate
-    name: Publish first source-only GitHub prerelease
+    name: Publish v1.0.0 Windows installer preview
     runs-on: ubuntu-latest
     permissions:
       contents: write
     steps:
       - uses: actions/checkout@v4
-      - name: Create v1.0.0 source-only prerelease once
+      - name: Download tested MSI and checksum
+        uses: actions/download-artifact@v4
+        with:
+          name: RDCM-1.0.0-windows-release-candidate
+          path: release-assets
+      - name: Publish a preview MSI, keeping the release marked as prerelease
         env:
           GH_TOKEN: ${{ github.token }}
         shell: bash
         run: |
           set -euo pipefail
-          if gh release view v1.0.0 --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
-            echo "v1.0.0 release already exists; preserving it."
-            exit 0
+          msi="$(find release-assets -type f -name 'RDCM-1.0.0-win-x64.msi' -print -quit)"
+          if [[ -z "$msi" ]]; then
+            echo "MSI absent from the downloaded CI artifact" >&2
+            exit 1
           fi
-          gh release create v1.0.0 \
+          if [[ "$msi" != "release-assets/RDCM-1.0.0-win-x64.msi" ]]; then
+            cp "$msi" release-assets/RDCM-1.0.0-win-x64.msi
+          fi
+          (cd release-assets && sha256sum -c RDCM-1.0.0-win-x64.msi.sha256)
+
+          if ! gh release view v1.0.0 --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release create v1.0.0 \
+              --repo "$GITHUB_REPOSITORY" \
+              --target "$GITHUB_SHA" \
+              --title "RDCM v1.0.0 — Windows installer preview" \
+              --notes-file docs/releases/v1.0.0.md \
+              --prerelease
+          fi
+
+          assets="$(gh release view v1.0.0 --repo "$GITHUB_REPOSITORY" --json assets --jq '.assets[].name')"
+          if grep -qx 'RDCM-1.0.0-win-x64.msi' <<< "$assets"; then
+            if ! grep -qx 'RDCM-1.0.0-win-x64.msi.sha256' <<< "$assets"; then
+              echo "MSI present without its checksum; refusing partial release update" >&2
+              exit 1
+            fi
+            echo "Previously published MSI and checksum found; preserving assets."
+          else
+            if grep -qx 'RDCM-1.0.0-win-x64.msi.sha256' <<< "$assets"; then
+              echo "Checksum present without MSI; refusing partial release update" >&2
+              exit 1
+            fi
+            gh release upload v1.0.0 \
+              release-assets/RDCM-1.0.0-win-x64.msi \
+              release-assets/RDCM-1.0.0-win-x64.msi.sha256 \
+              --repo "$GITHUB_REPOSITORY"
+          fi
+
+          gh release edit v1.0.0 \
             --repo "$GITHUB_REPOSITORY" \
-            --target "$GITHUB_SHA" \
-            --title "RDCM v1.0.0 — source preview" \
+            --title "RDCM v1.0.0 — Windows installer preview" \
             --notes-file docs/releases/v1.0.0.md \
             --prerelease
