@@ -17,7 +17,7 @@ if ($msiName -ne 'RDCM-1.0.0-win-x64.msi') {
 # Verify the actual MSI ProductVersion from its installer database, not its filename.
 $windowsInstaller = New-Object -ComObject WindowsInstaller.Installer
 $db = $windowsInstaller.OpenDatabase($installer, 0)
-$view = $db.OpenView('SELECT \`Value\` FROM \`Property\` WHERE \`Property\` = ''ProductVersion''')
+$view = $db.OpenView('SELECT `Value` FROM `Property` WHERE `Property` = ''ProductVersion''')
 $view.Execute()
 $row = $view.Fetch()
 $version = if ($null -ne $row) { [string] $row.StringData(1) } else { '' }
