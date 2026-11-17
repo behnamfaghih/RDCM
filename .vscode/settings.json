@@ -1,0 +1,5 @@
+{
+  // Keep AI-assisted changes attributed to the developer committing them.
+  // VS Code must not automatically append Copilot co-author trailers.
+  "git.addAICoAuthor": "off"
+}
