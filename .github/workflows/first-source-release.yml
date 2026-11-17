@@ -26,7 +26,7 @@ jobs:
         run: dotnet build .\installer\RDCM.Installer.wixproj -c Release --nologo
       - name: Smoke-test MSI installation and uninstall
         shell: pwsh
-        run: .\\.github\\scripts\\SmokeTest-RdcmInstaller.ps1 -InstallerPath .\\installer\\bin\\x64\\Release\\RDCM-1.0.0-win-x64.msi
+        run: ./.github/scripts/SmokeTest-RdcmInstaller.ps1 -InstallerPath ./installer/bin/x64/Release/RDCM-1.0.0-win-x64.msi
       - name: Generate SHA-256 checksum
         shell: pwsh
         run: |
@@ -66,11 +66,11 @@ jobs:
           (cd release-assets && sha256sum -c RDCM-1.0.0-win-x64.msi.sha256)
 
           if ! gh release view v1.0.0 --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
-            gh release create v1.0.0 \\
-              --repo "$GITHUB_REPOSITORY" \\
-              --target "$GITHUB_SHA" \\
-              --title "RDCM v1.0.0 — Windows installer preview" \\
-              --notes-file docs/releases/v1.0.0.md \\
+            gh release create v1.0.0 \
+              --repo "$GITHUB_REPOSITORY" \
+              --target "$GITHUB_SHA" \
+              --title "RDCM v1.0.0 — Windows installer preview" \
+              --notes-file docs/releases/v1.0.0.md \
               --prerelease
           fi
 
@@ -86,14 +86,14 @@ jobs:
               echo "Checksum present without MSI; refusing partial release update" >&2
               exit 1
             fi
-            gh release upload v1.0.0 \\
-              release-assets/RDCM-1.0.0-win-x64.msi \\
-              release-assets/RDCM-1.0.0-win-x64.msi.sha256 \\
+            gh release upload v1.0.0 \
+              release-assets/RDCM-1.0.0-win-x64.msi \
+              release-assets/RDCM-1.0.0-win-x64.msi.sha256 \
               --repo "$GITHUB_REPOSITORY"
           fi
 
-          gh release edit v1.0.0 \\
-            --repo "$GITHUB_REPOSITORY" \\
-            --title "RDCM v1.0.0 — Windows installer preview" \\
-            --notes-file docs/releases/v1.0.0.md \\
+          gh release edit v1.0.0 \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "RDCM v1.0.0 — Windows installer preview" \
+            --notes-file docs/releases/v1.0.0.md \
             --prerelease
