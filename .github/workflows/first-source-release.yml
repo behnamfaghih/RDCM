@@ -62,7 +62,14 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          cp release-assets/installer/bin/x64/Release/RDCM-1.0.0-win-x64.msi release-assets/RDCM-1.0.0-win-x64.msi
+          msi="$(find release-assets -type f -name 'RDCM-1.0.0-win-x64.msi' -print -quit)"
+          if [[ -z "$msi" ]]; then
+            echo "MSI absent from the downloaded CI artifact" >&2
+            exit 1
+          fi
+          if [[ "$msi" != "release-assets/RDCM-1.0.0-win-x64.msi" ]]; then
+            cp "$msi" release-assets/RDCM-1.0.0-win-x64.msi
+          fi
           (cd release-assets && sha256sum -c RDCM-1.0.0-win-x64.msi.sha256)
 
           if ! gh release view v1.0.0 --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
