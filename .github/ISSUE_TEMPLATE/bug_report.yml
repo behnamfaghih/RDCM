@@ -1,0 +1,34 @@
+name: Bug report
+description: Report a problem with RDCM.
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Redact credentials, usernames, hostnames and IP addresses from anything you share. For a security concern, use private vulnerability reporting. [RDCM advisories](https://github.com/behnamfaghih/RDCM/security/advisories)
+  - type: input
+    id: environment
+    attributes:
+      label: RDCM and Windows versions
+      description: Use the release or installer version if RDCM won’t start.
+      placeholder: RDCM 1.0.0 on Windows 11 24H2
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+      description: Describe what you did before the problem occurred.
+    validations:
+      required: true
+  - type: textarea
+    id: result
+    attributes:
+      label: Expected and actual behaviour
+      description: What did you expect and what happened?
+    validations:
+      required: true
+  - type: textarea
+    id: details
+    attributes:
+      label: Additional details
+      description: Include redacted Copy details output from RDCM, logs or screenshots if relevant. For accessibility issues, include how you navigate and any assistive technology involved.

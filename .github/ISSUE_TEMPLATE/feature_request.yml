@@ -1,0 +1,17 @@
+name: Feature request
+description: Suggest an improvement to RDCM.
+body:
+  - type: textarea
+    id: workflow
+    attributes:
+      label: What are you trying to do?
+      description: Describe your workflow and where you run into difficulty.
+    validations:
+      required: true
+  - type: textarea
+    id: improvement
+    attributes:
+      label: What would help?
+      description: Describe the improvement you’d like and any workaround you use today.
+    validations:
+      required: true
