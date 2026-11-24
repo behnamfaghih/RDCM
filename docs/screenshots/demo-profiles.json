@@ -1,0 +1,74 @@
+[
+  {
+    "Id": "5ee52fa7-7797-4c02-8709-053bdf7cf77e",
+    "Name": "Developer Workstation",
+    "Host": "dev-01.example.com",
+    "Port": 3389,
+    "Username": "EXAMPLE\\demo.admin",
+    "Group": "Development",
+    "Notes": "Local development and debugging. Fictional documentation sample."
+  },
+  {
+    "Id": "3f2c5a83-360f-4129-be0a-30bb77c492f0",
+    "Name": "Build Agent",
+    "Host": "build-01.example.com",
+    "Port": 3389,
+    "Username": "EXAMPLE\\demo.admin",
+    "Group": "Development",
+    "Notes": "Continuous integration build agent. Fictional documentation sample."
+  },
+  {
+    "Id": "87de4387-0070-47ac-9705-9fd8c972517e",
+    "Name": "Web Server 01",
+    "Host": "web-01.example.com",
+    "Port": 3389,
+    "Username": "EXAMPLE\\demo.admin",
+    "Group": "Production",
+    "Notes": "Production web front end. Fictional documentation sample."
+  },
+  {
+    "Id": "87777d35-b7cf-4ffc-a521-79768d29afea",
+    "Name": "Web Server 02",
+    "Host": "web-02.example.com",
+    "Port": 3389,
+    "Username": "EXAMPLE\\demo.admin",
+    "Group": "Production",
+    "Notes": "Production web front end, secondary node. Fictional documentation sample."
+  },
+  {
+    "Id": "be66c2bc-5d24-48da-8fae-1a021d2a46a8",
+    "Name": "Database Server",
+    "Host": "db-01.example.com",
+    "Port": 3389,
+    "Username": "EXAMPLE\\demo.admin",
+    "Group": "Production",
+    "Notes": "Production database administration. Fictional documentation sample."
+  },
+  {
+    "Id": "1a947035-005d-4d9b-ba5b-b93dfe7e6a10",
+    "Name": "Application Server",
+    "Host": "app-01.example.com",
+    "Port": 3389,
+    "Username": "EXAMPLE\\demo.admin",
+    "Group": "Production",
+    "Notes": "Business application services. Fictional documentation sample."
+  },
+  {
+    "Id": "e7299434-cd66-4c5b-80cc-72eb6185db80",
+    "Name": "Staging Web",
+    "Host": "stg-web.example.com",
+    "Port": 3389,
+    "Username": "EXAMPLE\\demo.admin",
+    "Group": "Staging",
+    "Notes": "Pre-release acceptance testing. Fictional documentation sample."
+  },
+  {
+    "Id": "8575f908-9a3b-4363-9f8b-9f8ceb3c208a",
+    "Name": "Staging Database",
+    "Host": "stg-db.example.com",
+    "Port": 3389,
+    "Username": "EXAMPLE\\demo.admin",
+    "Group": "Staging",
+    "Notes": "Test data and schema validation. Fictional documentation sample."
+  }
+]

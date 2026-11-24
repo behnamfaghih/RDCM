@@ -2,6 +2,12 @@
 
 RDCM is a Windows WPF manager for saved Remote Desktop (RDP) connection profiles. Connect directly from RDCM and view each remote desktop in its own in-app workspace tab, powered by the Windows Remote Desktop ActiveX control. RDCM does not launch the separate `mstsc.exe` client.
 
+## Screenshots
+
+![RDCM in dark mode with grouped connection profiles and favourites](docs/screenshots/overview-dark.jpg)
+
+[View the screenshot gallery](docs/screenshots/README.md) for light mode, profile editing, search, compact favourites and the command palette. All screenshots use fictional demo profiles.
+
 ## License
 
 RDCM's original source code is available under the [MIT License](LICENSE). The Windows Remote Desktop components supplied by Windows and the WiX installer toolchain retain their own terms. See the [v1.0.0 stable release notes](docs/releases/v1.0.0.md) for automated test evidence, maintainer-reported manual validation, download verification and the unsigned-installer limitation.
